@@ -1,0 +1,23 @@
+[package]
+name = "resonance-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+windows = { version = "=0.62.2", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+] }
+windows-core = { version = "=0.62.2", optional = true }
+crossbeam-channel = "0.5"
+tracing = "0.1"
+
+[features]
+default = ["com-backend"]
+com-backend = ["dep:windows", "dep:windows-core"]

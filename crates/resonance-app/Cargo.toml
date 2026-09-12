@@ -1,0 +1,16 @@
+[package]
+name = "resonance-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "resonance-app"
+path = "src/main.rs"
+
+[dependencies]
+resonance-core = { path = "../resonance-core" }
+resonance-state = { path = "../resonance-state" }
+crossbeam-channel = "0.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

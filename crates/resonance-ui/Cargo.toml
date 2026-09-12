@@ -1,0 +1,8 @@
+[package]
+name = "resonance-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+resonance-core = { path = "../resonance-core" }

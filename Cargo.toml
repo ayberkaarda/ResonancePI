@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/resonance-core",
+    "crates/resonance-state",
+    "crates/resonance-ui",
+    "crates/resonance-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = 3
+
+[profile.release.package.resonance-ui]
+opt-level = "z"
