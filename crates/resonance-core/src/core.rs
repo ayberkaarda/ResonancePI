@@ -7,41 +7,93 @@
 //! boundary. The only things that leave the thread are owned values
 //! (`EndpointView`, `EndpointId`, `AudioEvent`).
 //!
-//! Device notifications are delivered by the audio service on its own MTA
-//! worker threads. The notification sink therefore holds nothing but a cloned
-//! `Sender<AudioEvent>`: it never calls a COM method, never takes a lock, and
-//! returns immediately after enqueueing an event.
+//! Device and session notifications are delivered by the audio service on its
+//! own MTA worker threads. Every notification sink therefore holds nothing but
+//! owned data and a cloned channel sender: it never calls a COM method, never
+//! takes a lock, and returns immediately after enqueueing.
+//!
+//! `IAudioSessionNotification::OnSessionCreated` is the one callback that is
+//! handed a live COM object rather than plain data. Because the callback is not
+//! allowed to call into COM, it only takes a reference on the object
+//! (`Ref::cloned`, an AddRef) and forwards it over an internal channel to the
+//! core thread, which does all the real work. That channel is deliberately
+//! private to this module: it carries a Windows type and must not appear in
+//! `messages`, which stays platform-independent.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{bounded, select, unbounded, Receiver, Sender};
 use tracing::{debug, info, trace, warn};
 
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
+use windows::Win32::Foundation::{CloseHandle, HANDLE, S_OK};
 use windows::Win32::Media::Audio::{
-    eCapture, eCommunications, eConsole, eMultimedia, eRender, EDataFlow, ERole, IMMDevice,
-    IMMDeviceEnumerator, IMMNotificationClient, IMMNotificationClient_Impl, MMDeviceEnumerator,
-    DEVICE_STATE, DEVICE_STATE_ACTIVE, DEVICE_STATE_DISABLED, DEVICE_STATE_NOTPRESENT,
-    DEVICE_STATE_UNPLUGGED,
+    eCapture, eCommunications, eConsole, eMultimedia, eRender, AudioSessionDisconnectReason,
+    AudioSessionState, AudioSessionStateActive, AudioSessionStateExpired,
+    DisconnectReasonDeviceRemoval, DisconnectReasonExclusiveModeOverride,
+    DisconnectReasonFormatChanged, DisconnectReasonServerShutdown,
+    DisconnectReasonSessionDisconnected, DisconnectReasonSessionLogoff, EDataFlow, ERole,
+    IAudioSessionControl, IAudioSessionControl2, IAudioSessionEvents, IAudioSessionEvents_Impl,
+    IAudioSessionManager2, IAudioSessionNotification, IAudioSessionNotification_Impl, IMMDevice,
+    IMMDeviceEnumerator, IMMNotificationClient, IMMNotificationClient_Impl, ISimpleAudioVolume,
+    MMDeviceEnumerator, DEVICE_STATE, DEVICE_STATE_ACTIVE, DEVICE_STATE_DISABLED,
+    DEVICE_STATE_NOTPRESENT, DEVICE_STATE_UNPLUGGED,
 };
 use windows::Win32::System::Com::StructuredStorage::{PropVariantClear, PROPVARIANT};
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
+    CoCreateGuid, CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
     COINIT_MULTITHREADED, STGM_READ,
+};
+use windows::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::System::Variant::VT_LPWSTR;
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
-use windows_core::{implement, Error as ComError, Result as ComResult, PCWSTR};
+use windows_core::{
+    implement, Error as ComError, Interface, Ref, Result as ComResult, BOOL, GUID, PCWSTR, PWSTR,
+};
 
 use crate::messages::{
-    AudioEvent, CoreCommand, CoreError, DataFlow, EndpointId, EndpointState, EndpointView, Role,
+    AudioEvent, CoreCommand, CoreError, DataFlow, DisconnectReason, EndpointId, EndpointState,
+    EndpointView, ProcessKey, Role, SessionInfo, SessionInstanceId, SessionState,
 };
 
 /// The role reported as "the" default render endpoint at startup. Windows'
 /// "Default Device" in the sound control panel maps to the console role.
 const DEFAULT_ROLE: ERole = eConsole;
+
+/// Upper bound for a process image path, in UTF-16 code units.
+///
+/// `QueryFullProcessImageNameW` can return an extended-length path, which is
+/// capped at 32767 characters; this buffer is generous enough for every real
+/// executable path while staying small enough to live on the stack.
+const IMAGE_PATH_CAPACITY: usize = 1024;
+
+/// Process-wide GUID that tags every volume/mute write Resonance makes itself.
+///
+/// `ISimpleAudioVolume::SetMasterVolume`/`SetMute` echo back through
+/// `IAudioSessionEvents::OnSimpleVolumeChanged`; comparing the event context
+/// against this GUID is what separates "the user moved a slider" from "we just
+/// restored a profile".
+static EVENT_CONTEXT: OnceLock<GUID> = OnceLock::new();
+
+/// Generate the process-wide event context once, on the core thread.
+///
+/// Idempotent: a second call returns the GUID produced by the first.
+fn init_event_context() -> Result<GUID, CoreError> {
+    if let Some(existing) = EVENT_CONTEXT.get() {
+        return Ok(*existing);
+    }
+    // SAFETY: `CoCreateGuid` takes no arguments and writes into a stack slot
+    // owned by the wrapper. It has no apartment requirement, so it is safe to
+    // call here on the audio core thread right after CoInitializeEx.
+    let guid = unsafe { CoCreateGuid() }
+        .map_err(|e| CoreError::ComInitFailed(format!("CoCreateGuid failed: {e}")))?;
+    Ok(*EVENT_CONTEXT.get_or_init(|| guid))
+}
 
 /// Result of the one-shot bootstrap performed by the core thread: the world as
 /// it looked the moment notifications were armed. Owned data only.
@@ -123,7 +175,18 @@ fn core_thread_main(
         }
     };
 
-    let core = match AudioCore::new(ev_tx) {
+    if let Err(err) = init_event_context() {
+        let _ = init_tx.send(Err(err));
+        return;
+    }
+
+    // Internal, Windows-typed handoff channel: `OnSessionCreated` is the only
+    // callback that receives a live COM object, and it may not touch it. It
+    // AddRefs the object and posts it here; everything below runs on this
+    // thread.
+    let (raw_tx, raw_rx) = unbounded::<RawSessionEvent>();
+
+    let mut core = match AudioCore::new(ev_tx, raw_tx) {
         Ok(core) => core,
         Err(err) => {
             let _ = init_tx.send(Err(err));
@@ -141,21 +204,35 @@ fn core_thread_main(
 
     info!(
         endpoints = startup.endpoints.len(),
-        "audio core ready (MTA, endpoint notifications registered)"
+        sessions = core.session_count(),
+        "audio core ready (MTA, endpoint and session notifications registered)"
     );
     let _ = init_tx.send(Ok(startup));
 
     loop {
-        match cmd_rx.recv() {
-            Ok(CoreCommand::Shutdown) => {
-                debug!("core received Shutdown");
-                break;
-            }
-            Err(_) => {
-                debug!("command channel closed, stopping audio core");
-                break;
-            }
-            Ok(other) => core.handle(other),
+        select! {
+            recv(cmd_rx) -> message => match message {
+                Ok(CoreCommand::Shutdown) => {
+                    debug!("core received Shutdown");
+                    break;
+                }
+                Ok(other) => core.handle(other),
+                Err(_) => {
+                    debug!("command channel closed, stopping audio core");
+                    break;
+                }
+            },
+            recv(raw_rx) -> message => match message {
+                Ok(RawSessionEvent::Created { endpoint, control }) => {
+                    core.on_session_created(&endpoint, control.0);
+                }
+                Err(_) => {
+                    // Unreachable in practice: `core` owns a sender for this
+                    // channel, so it cannot disconnect while the loop runs.
+                    warn!("internal session channel closed, stopping audio core");
+                    break;
+                }
+            },
         }
     }
 
@@ -211,10 +288,18 @@ struct AudioCore {
     enumerator: IMMDeviceEnumerator,
     /// Keeps the notification sink alive for as long as it is registered.
     notify: IMMNotificationClient,
+    /// One hook per active render endpoint. Profiles are per endpoint and
+    /// sessions live on non-default devices too, so every active render
+    /// endpoint gets its own session manager.
+    endpoints: HashMap<EndpointId, EndpointHook>,
+    /// Outbound, platform-independent event channel.
+    ev_tx: Sender<AudioEvent>,
+    /// Internal handoff channel handed to every `SessionNotifier`.
+    raw_tx: Sender<RawSessionEvent>,
 }
 
 impl AudioCore {
-    fn new(ev_tx: Sender<AudioEvent>) -> Result<Self, CoreError> {
+    fn new(ev_tx: Sender<AudioEvent>, raw_tx: Sender<RawSessionEvent>) -> Result<Self, CoreError> {
         // SAFETY: runs on the audio core thread, after CoInitializeEx has put
         // it into the MTA. `MMDeviceEnumerator` is a static CLSID constant, so
         // the pointer passed in is valid for the duration of the call; no
@@ -227,7 +312,7 @@ impl AudioCore {
             CoreError::ComInitFailed(format!("CoCreateInstance(MMDeviceEnumerator) failed: {e}"))
         })?;
 
-        let notify: IMMNotificationClient = DeviceNotifySink { tx: ev_tx }.into();
+        let notify: IMMNotificationClient = DeviceNotifySink { tx: ev_tx.clone() }.into();
 
         // SAFETY: runs on the audio core thread. `notify` is kept alive in the
         // returned struct for at least as long as the registration (it is
@@ -237,10 +322,16 @@ impl AudioCore {
             CoreError::ComInitFailed(format!("RegisterEndpointNotificationCallback failed: {e}"))
         })?;
 
-        Ok(Self { enumerator, notify })
+        Ok(Self {
+            enumerator,
+            notify,
+            endpoints: HashMap::new(),
+            ev_tx,
+            raw_tx,
+        })
     }
 
-    fn bootstrap_snapshot(&self) -> Result<CoreStartup, CoreError> {
+    fn bootstrap_snapshot(&mut self) -> Result<CoreStartup, CoreError> {
         let endpoints = self.active_render_endpoints()?;
         let default_render = self.default_render_endpoint();
         Ok(CoreStartup {
@@ -249,7 +340,20 @@ impl AudioCore {
         })
     }
 
-    fn active_render_endpoints(&self) -> Result<Vec<EndpointView>, CoreError> {
+    /// Number of sessions currently hooked across all endpoints.
+    fn session_count(&self) -> usize {
+        self.endpoints
+            .values()
+            .map(|hook| hook.sessions.len())
+            .sum()
+    }
+
+    #[inline]
+    fn emit(&self, event: AudioEvent) {
+        let _ = self.ev_tx.send(event);
+    }
+
+    fn active_render_endpoints(&mut self) -> Result<Vec<EndpointView>, CoreError> {
         // SAFETY: runs on the audio core thread that owns `self.enumerator`.
         // The returned collection is a COM object owned by this scope.
         let collection = unsafe {
@@ -278,7 +382,10 @@ impl AudioCore {
                 }
             };
             match endpoint_view(&device) {
-                Ok(view) => endpoints.push(view),
+                Ok(view) => {
+                    self.hook_endpoint(&device, &view.id);
+                    endpoints.push(view);
+                }
                 Err(err) => {
                     warn!(index, error = ?err, "could not describe endpoint, skipping it");
                 }
@@ -286,6 +393,151 @@ impl AudioCore {
         }
 
         Ok(endpoints)
+    }
+
+    /// Attach an `IAudioSessionManager2` to one render endpoint, arm session
+    /// notifications on it and hook every session that already exists.
+    ///
+    /// Failures are logged and skipped: one endpoint that refuses to activate a
+    /// session manager must not take the whole core down.
+    fn hook_endpoint(&mut self, device: &IMMDevice, endpoint: &EndpointId) {
+        if self.endpoints.contains_key(endpoint) {
+            return;
+        }
+
+        // SAFETY: runs on the audio core thread that owns `device`. The CLSCTX
+        // is a plain flag and `None` means "no activation parameters"; the
+        // returned manager is owned by the `EndpointHook` built below and never
+        // leaves this thread.
+        let activated = unsafe { device.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None) };
+        let manager = match activated {
+            Ok(manager) => manager,
+            Err(e) => {
+                warn!(%endpoint, error = %e, "IMMDevice::Activate(IAudioSessionManager2) failed, endpoint has no session support");
+                return;
+            }
+        };
+
+        let notifier: IAudioSessionNotification = SessionNotifier {
+            endpoint: endpoint.clone(),
+            tx: self.raw_tx.clone(),
+        }
+        .into();
+
+        // SAFETY: runs on the audio core thread. `notifier` is kept alive by
+        // the `EndpointHook` for as long as the registration lasts; the hook's
+        // `Drop` unregisters before releasing it.
+        if let Err(e) = unsafe { manager.RegisterSessionNotification(&notifier) } {
+            warn!(%endpoint, error = %e, "RegisterSessionNotification failed, no session events for this endpoint");
+            return;
+        }
+
+        let hook = EndpointHook {
+            endpoint: endpoint.clone(),
+            manager,
+            notifier,
+            sessions: HashMap::new(),
+        };
+
+        // The session enumeration API discards new-session notifications until
+        // the existing list has been retrieved once, and retrieving the list
+        // means calling `GetCount` on the enumerator, not merely obtaining it.
+        // Skipping this leaves `OnSessionCreated` permanently silent.
+        let existing = hook.enumerate_sessions();
+
+        self.endpoints.insert(endpoint.clone(), hook);
+        debug!(%endpoint, existing = existing.len(), "session notifications armed");
+
+        for control in existing {
+            self.on_session_created(endpoint, control);
+        }
+    }
+
+    /// Do the real work for a session that either already existed or was just
+    /// announced by `OnSessionCreated`. Always runs on the core thread.
+    fn on_session_created(&mut self, endpoint: &EndpointId, control: IAudioSessionControl) {
+        if !self.endpoints.contains_key(endpoint) {
+            trace!(%endpoint, "session announced for an endpoint that is not hooked, ignoring");
+            return;
+        }
+        match hook_session(endpoint, control, &self.ev_tx) {
+            Ok(Some((info, handle))) => {
+                let Some(hook) = self.endpoints.get_mut(endpoint) else {
+                    return;
+                };
+                if hook.sessions.contains_key(&info.instance) {
+                    // Already hooked (duplicate notification, or a resync that
+                    // raced a live notification). `handle` drops here and
+                    // unregisters its own sink.
+                    trace!(%endpoint, instance = %info.instance, "session already hooked, dropping duplicate");
+                    return;
+                }
+                debug!(%endpoint, process = %info.process, instance = %info.instance, volume = info.volume, muted = info.muted, "session hooked");
+                hook.sessions.insert(info.instance.clone(), handle);
+                self.emit(AudioEvent::SessionCreated {
+                    endpoint: endpoint.clone(),
+                    session: info,
+                });
+            }
+            Ok(None) => {}
+            Err(err) => {
+                warn!(%endpoint, error = ?err, "could not hook a session");
+            }
+        }
+    }
+
+    /// Re-enumerate one endpoint: hook sessions that appeared while we were not
+    /// listening and re-announce the ones already known with their current
+    /// volume, so a consumer that missed events can rebuild its picture.
+    fn resync_endpoint(&mut self, endpoint: &EndpointId) {
+        let Some(hook) = self.endpoints.get(endpoint) else {
+            warn!(%endpoint, "ResyncEndpoint for an endpoint that is not hooked");
+            return;
+        };
+
+        // Both COM reads happen while the immutable borrow of the registry is
+        // alive; the results are owned, so the borrow ends before anything is
+        // inserted back into it below.
+        let readings: Vec<(SessionInstanceId, ComResult<(f32, bool)>)> = hook
+            .sessions
+            .iter()
+            .map(|(instance, handle)| (instance.clone(), handle.read_volume()))
+            .collect();
+        let controls = hook.enumerate_sessions();
+
+        for (instance, reading) in readings {
+            match reading {
+                Ok((volume, muted)) => self.emit(AudioEvent::SessionVolumeChanged {
+                    instance,
+                    volume,
+                    muted,
+                    own_change: false,
+                }),
+                Err(e) => {
+                    warn!(%endpoint, %instance, error = %e, "could not read session volume during resync");
+                }
+            }
+        }
+
+        for control in controls {
+            self.on_session_created(endpoint, control);
+        }
+    }
+
+    /// Apply a volume/mute pair to one hooked session, tagged with
+    /// `EVENT_CONTEXT` so the echo comes back marked as our own change.
+    fn apply_session_volume(&self, instance: &SessionInstanceId, volume: f32, muted: bool) {
+        let Some(handle) = self
+            .endpoints
+            .values()
+            .find_map(|hook| hook.sessions.get(instance))
+        else {
+            debug!(%instance, "ApplySessionVolume for an unknown session, ignoring");
+            return;
+        };
+        if let Err(e) = handle.apply(volume, muted) {
+            warn!(%instance, error = %e, "ApplySessionVolume failed");
+        }
     }
 
     fn default_render_endpoint(&self) -> Option<EndpointId> {
@@ -311,18 +563,18 @@ impl AudioCore {
         }
     }
 
-    fn handle(&self, command: CoreCommand) {
+    fn handle(&mut self, command: CoreCommand) {
         match command {
             CoreCommand::Shutdown => {}
-            CoreCommand::ApplySessionVolume { .. } => {
-                warn!("ApplySessionVolume ignored: session support is not implemented yet");
-            }
+            CoreCommand::ApplySessionVolume {
+                instance,
+                volume,
+                muted,
+            } => self.apply_session_volume(&instance, volume, muted),
             CoreCommand::SetDefaultEndpoint { .. } => {
                 warn!("SetDefaultEndpoint ignored: endpoint switching is not implemented yet");
             }
-            CoreCommand::ResyncEndpoint(_) => {
-                warn!("ResyncEndpoint ignored: session support is not implemented yet");
-            }
+            CoreCommand::ResyncEndpoint(id) => self.resync_endpoint(&id),
         }
     }
 }
@@ -342,6 +594,531 @@ impl Drop for AudioCore {
             debug!("endpoint notification callback unregistered");
         }
     }
+}
+
+/// Session state of one render endpoint: its session manager, the registered
+/// new-session notifier, and every session currently hooked on it.
+///
+/// Lives only inside `AudioCore`, which lives only on the core thread, so its
+/// `Drop` — and every COM release it performs — runs there.
+struct EndpointHook {
+    endpoint: EndpointId,
+    manager: IAudioSessionManager2,
+    /// Keeps the `#[implement]` object alive while it is registered.
+    notifier: IAudioSessionNotification,
+    sessions: HashMap<SessionInstanceId, SessionHandle>,
+}
+
+impl EndpointHook {
+    /// Retrieve the endpoint's current session list.
+    ///
+    /// Calling `GetCount` on the enumerator is mandatory and not merely
+    /// informational: until the list has been retrieved once, the audio service
+    /// discards new-session notifications for this manager.
+    fn enumerate_sessions(&self) -> Vec<IAudioSessionControl> {
+        // SAFETY: runs on the audio core thread that owns `self.manager`; the
+        // enumerator returned is a COM object owned by this scope.
+        let enumerator = match unsafe { self.manager.GetSessionEnumerator() } {
+            Ok(enumerator) => enumerator,
+            Err(e) => {
+                warn!(endpoint = %self.endpoint, error = %e, "GetSessionEnumerator failed");
+                return Vec::new();
+            }
+        };
+
+        // SAFETY: `enumerator` is live and used only on this thread. Unlike
+        // `IMMDeviceCollection::GetCount` this one yields a signed count.
+        let count = match unsafe { enumerator.GetCount() } {
+            Ok(count) => count,
+            Err(e) => {
+                warn!(endpoint = %self.endpoint, error = %e, "IAudioSessionEnumerator::GetCount failed");
+                return Vec::new();
+            }
+        };
+
+        let mut sessions = Vec::with_capacity(count.max(0) as usize);
+        for index in 0..count {
+            // SAFETY: `index` is below the count just read from the same
+            // enumerator, which stays alive for this whole loop.
+            match unsafe { enumerator.GetSession(index) } {
+                Ok(control) => sessions.push(control),
+                Err(e) => {
+                    warn!(endpoint = %self.endpoint, index, error = %e, "IAudioSessionEnumerator::GetSession failed");
+                }
+            }
+        }
+        sessions
+    }
+}
+
+impl Drop for EndpointHook {
+    fn drop(&mut self) {
+        // The sessions are released first, each unregistering its own event
+        // sink, before this endpoint's new-session notification goes away.
+        self.sessions.clear();
+
+        // SAFETY: runs on the audio core thread while both the manager and the
+        // notifier are still alive. Unregistering before the notifier is
+        // released is what keeps the audio service from calling into a freed
+        // object.
+        if let Err(e) = unsafe { self.manager.UnregisterSessionNotification(&self.notifier) } {
+            warn!(endpoint = %self.endpoint, error = %e, "UnregisterSessionNotification failed");
+        } else {
+            debug!(endpoint = %self.endpoint, "session notifications disarmed");
+        }
+    }
+}
+
+/// Internal, Windows-typed handoff message.
+///
+/// Deliberately private to this module: it carries a COM interface pointer and
+/// therefore must never appear in `messages`, which stays free of `windows`
+/// types so `resonance-state` can be built and tested on any OS.
+enum RawSessionEvent {
+    Created {
+        endpoint: EndpointId,
+        control: MtaSessionControl,
+    },
+}
+
+/// An owned `IAudioSessionControl` reference in transit between two threads of
+/// the same multi-threaded apartment.
+///
+/// The `windows` wrapper types are not `Send` — correctly so, since a COM
+/// pointer generally may not cross an apartment boundary without marshalling.
+/// This wrapper narrows that rule to the one case Resonance relies on and makes
+/// the reasoning explicit at the type level rather than leaving it implicit.
+struct MtaSessionControl(IAudioSessionControl);
+
+// SAFETY: the only producer of this value is `SessionNotifier::OnSessionCreated`
+// and the only consumer is the audio core thread. Both are in the same
+// multi-threaded apartment — the audio service calls MTA sinks from its own MTA
+// worker threads, and the core thread initialises COM with
+// COINIT_MULTITHREADED — and COM allows an interface pointer to be used from
+// any thread of the apartment it belongs to without marshalling. The reference
+// taken by `Ref::cloned` is released by whichever of those two threads drops
+// the value, so the release also happens inside that same apartment.
+unsafe impl Send for MtaSessionControl {}
+
+/// New-session notification sink, one per endpoint.
+///
+/// Holds an endpoint id and a channel sender; no COM pointer, no lock. The one
+/// thing it does with the object it is handed is take a reference on it
+/// (`Ref::cloned` is an AddRef, not a call into the object), because the
+/// pointer is only valid for the duration of the callback. Everything else —
+/// the QueryInterface, the process lookup, the registration — happens on the
+/// core thread.
+#[implement(IAudioSessionNotification)]
+struct SessionNotifier {
+    endpoint: EndpointId,
+    tx: Sender<RawSessionEvent>,
+}
+
+/// Invoked on audio-service worker threads, so it must be `Send + Sync`.
+/// Asserted at compile time so a future field that is not thread-safe fails the
+/// build here.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<SessionNotifier>();
+};
+
+#[allow(non_snake_case)]
+impl IAudioSessionNotification_Impl for SessionNotifier_Impl {
+    fn OnSessionCreated(&self, newsession: Ref<'_, IAudioSessionControl>) -> ComResult<()> {
+        let Some(control) = newsession.cloned() else {
+            trace!(endpoint = %self.endpoint, "OnSessionCreated with a null session, ignoring");
+            return Ok(());
+        };
+        trace!(endpoint = %self.endpoint, "OnSessionCreated");
+        let _ = self.tx.send(RawSessionEvent::Created {
+            endpoint: self.endpoint.clone(),
+            control: MtaSessionControl(control),
+        });
+        Ok(())
+    }
+}
+
+/// One hooked session. Owns the COM pointers for that session and keeps its
+/// event sink alive; created, used and dropped on the core thread only.
+struct SessionHandle {
+    control: IAudioSessionControl2,
+    volume: ISimpleAudioVolume,
+    /// Keeps the `#[implement]` object alive while it is registered.
+    sink: IAudioSessionEvents,
+}
+
+impl SessionHandle {
+    fn read_volume(&self) -> ComResult<(f32, bool)> {
+        // SAFETY: runs on the audio core thread that owns `self.volume`; both
+        // calls only write into stack slots owned by the wrapper.
+        let level = unsafe { self.volume.GetMasterVolume() }?;
+        // SAFETY: as above. `GetMute` yields a `BOOL`, not a Rust `bool`.
+        let muted = unsafe { self.volume.GetMute() }?;
+        Ok((level, muted.as_bool()))
+    }
+
+    fn apply(&self, volume: f32, muted: bool) -> ComResult<()> {
+        let context = EVENT_CONTEXT
+            .get()
+            .ok_or_else(|| ComError::from_hresult(windows::Win32::Foundation::E_UNEXPECTED))?;
+        // SAFETY: runs on the audio core thread that owns `self.volume`.
+        // `context` points at a `'static` GUID that outlives the call; passing
+        // it is what makes the resulting `OnSimpleVolumeChanged` recognisable
+        // as our own write rather than a user action.
+        unsafe { self.volume.SetMasterVolume(volume.clamp(0.0, 1.0), context) }?;
+        // SAFETY: as above; `SetMute` takes a Rust `bool` here, unlike
+        // `GetMute`, which returns a `BOOL`.
+        unsafe { self.volume.SetMute(muted, context) }?;
+        Ok(())
+    }
+}
+
+impl Drop for SessionHandle {
+    fn drop(&mut self) {
+        // SAFETY: runs on the audio core thread (the registry that owns every
+        // `SessionHandle` lives there), while both the control and the sink are
+        // still alive. Unregistering before the sink is released keeps the
+        // audio service from calling into a freed object.
+        if let Err(e) = unsafe { self.control.UnregisterAudioSessionNotification(&self.sink) } {
+            warn!(error = %e, "UnregisterAudioSessionNotification failed");
+        }
+    }
+}
+
+/// Per-session event sink.
+///
+/// Holds an instance id and a channel sender: no COM pointer, no lock. Its
+/// methods run on audio-service worker threads, so they only translate the
+/// callback into an owned `AudioEvent`, enqueue it and return.
+#[implement(IAudioSessionEvents)]
+struct SessionEventSink {
+    instance: SessionInstanceId,
+    tx: Sender<AudioEvent>,
+}
+
+/// Invoked on audio-service worker threads, so it must be `Send + Sync`.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<SessionEventSink>();
+};
+
+impl SessionEventSink {
+    #[inline]
+    fn emit(&self, event: AudioEvent) {
+        // The channel is unbounded, so this never blocks the calling worker
+        // thread. If the consumer is gone the event is dropped on purpose.
+        let _ = self.tx.send(event);
+    }
+}
+
+#[allow(non_snake_case)]
+impl IAudioSessionEvents_Impl for SessionEventSink_Impl {
+    fn OnDisplayNameChanged(&self, _name: &PCWSTR, _context: *const GUID) -> ComResult<()> {
+        Ok(())
+    }
+
+    fn OnIconPathChanged(&self, _path: &PCWSTR, _context: *const GUID) -> ComResult<()> {
+        Ok(())
+    }
+
+    fn OnSimpleVolumeChanged(
+        &self,
+        newvolume: f32,
+        newmute: BOOL,
+        eventcontext: *const GUID,
+    ) -> ComResult<()> {
+        let own_change = is_own_event_context(eventcontext);
+        trace!(instance = %self.instance, newvolume, own_change, "OnSimpleVolumeChanged");
+        self.emit(AudioEvent::SessionVolumeChanged {
+            instance: self.instance.clone(),
+            volume: newvolume,
+            muted: newmute.as_bool(),
+            own_change,
+        });
+        Ok(())
+    }
+
+    fn OnChannelVolumeChanged(
+        &self,
+        _channelcount: u32,
+        _newchannelvolumearray: *const f32,
+        _changedchannel: u32,
+        _eventcontext: *const GUID,
+    ) -> ComResult<()> {
+        // Resonance manages the master volume of a session, not its individual
+        // channels; there is no message type for per-channel changes.
+        Ok(())
+    }
+
+    fn OnGroupingParamChanged(
+        &self,
+        _newgroupingparam: *const GUID,
+        _eventcontext: *const GUID,
+    ) -> ComResult<()> {
+        Ok(())
+    }
+
+    fn OnStateChanged(&self, newstate: AudioSessionState) -> ComResult<()> {
+        let state = SessionState::from(newstate);
+        trace!(instance = %self.instance, ?state, "OnStateChanged");
+        self.emit(AudioEvent::SessionStateChanged {
+            instance: self.instance.clone(),
+            state,
+        });
+        Ok(())
+    }
+
+    fn OnSessionDisconnected(
+        &self,
+        disconnectreason: AudioSessionDisconnectReason,
+    ) -> ComResult<()> {
+        let reason = DisconnectReason::from(disconnectreason);
+        trace!(instance = %self.instance, ?reason, "OnSessionDisconnected");
+        self.emit(AudioEvent::SessionDisconnected {
+            instance: self.instance.clone(),
+            reason,
+        });
+        Ok(())
+    }
+}
+
+/// Decide whether a callback's event context is the GUID Resonance stamps on
+/// its own volume writes.
+fn is_own_event_context(context: *const GUID) -> bool {
+    // SAFETY: the audio service passes either null or a pointer to a GUID that
+    // is valid for the duration of the callback. The value is only read here
+    // and the pointer is not retained.
+    let observed = unsafe { context.as_ref() };
+    observed
+        .zip(EVENT_CONTEXT.get())
+        .is_some_and(|(observed, ours)| observed == ours)
+}
+
+/// Windows defines three session states; an unrecognised value could only come
+/// from a future revision and is treated as inactive, the state with no
+/// side effects.
+impl From<AudioSessionState> for SessionState {
+    fn from(value: AudioSessionState) -> Self {
+        if value == AudioSessionStateActive {
+            Self::Active
+        } else if value == AudioSessionStateExpired {
+            Self::Expired
+        } else {
+            Self::Inactive
+        }
+    }
+}
+
+/// Windows defines six disconnect reasons; an unrecognised value could only
+/// come from a future revision and is reported as a server shutdown, whose
+/// handling — let the session go — is correct for any unknown cause.
+impl From<AudioSessionDisconnectReason> for DisconnectReason {
+    fn from(value: AudioSessionDisconnectReason) -> Self {
+        if value == DisconnectReasonDeviceRemoval {
+            Self::DeviceRemoval
+        } else if value == DisconnectReasonFormatChanged {
+            Self::FormatChanged
+        } else if value == DisconnectReasonSessionLogoff {
+            Self::SessionLogoff
+        } else if value == DisconnectReasonSessionDisconnected {
+            Self::SessionDisconnected
+        } else if value == DisconnectReasonExclusiveModeOverride {
+            Self::ExclusiveModeOverride
+        } else if value == DisconnectReasonServerShutdown {
+            Self::ServerShutdown
+        } else {
+            trace!(raw = value.0, "unknown AudioSessionDisconnectReason");
+            Self::ServerShutdown
+        }
+    }
+}
+
+/// Turn a freshly announced `IAudioSessionControl` into a hooked session.
+///
+/// Returns `Ok(None)` for sessions Resonance deliberately ignores (the system
+/// sounds session). Every COM call below happens on the core thread.
+fn hook_session(
+    endpoint: &EndpointId,
+    control: IAudioSessionControl,
+    ev_tx: &Sender<AudioEvent>,
+) -> Result<Option<(SessionInfo, SessionHandle)>, CoreError> {
+    let control: IAudioSessionControl2 = control
+        .cast()
+        .map_err(|e| session_error(format!("cast to IAudioSessionControl2 failed: {e}")))?;
+
+    // SAFETY: `control` is a live interface pointer used on the core thread.
+    // This method returns a raw HRESULT rather than a Result: S_OK means "yes,
+    // system sounds", S_FALSE means "no". Treating both as success — which
+    // `.ok()` would do — would silently answer the question wrongly.
+    let is_system_sounds = unsafe { control.IsSystemSoundsSession() } == S_OK;
+    if is_system_sounds {
+        trace!(%endpoint, "skipping the system sounds session");
+        return Ok(None);
+    }
+
+    // SAFETY: `control` is live and used on the core thread. The returned
+    // string is allocated with CoTaskMemAlloc and ownership passes to us;
+    // `take_pwstr` reads it once and frees it with the matching allocator.
+    let raw_instance = unsafe { control.GetSessionInstanceIdentifier() }
+        .map_err(|e| session_error(format!("GetSessionInstanceIdentifier failed: {e}")))?;
+    let instance = take_pwstr(raw_instance).ok_or_else(|| {
+        session_error("GetSessionInstanceIdentifier returned no usable string".to_owned())
+    })?;
+
+    // SAFETY: as above; this identifier is the per-application one and is used
+    // only as a fallback source for the process name.
+    let raw_identifier = unsafe { control.GetSessionIdentifier() }.ok();
+    let identifier = raw_identifier.and_then(take_pwstr);
+
+    // SAFETY: `control` is live and used on the core thread; `GetProcessId`
+    // writes into a stack slot owned by the wrapper.
+    let pid = unsafe { control.GetProcessId() }
+        .map_err(|e| session_error(format!("GetProcessId failed: {e}")))?;
+
+    let process = resolve_process_key(pid, identifier.as_deref());
+
+    let volume: ISimpleAudioVolume = control
+        .cast()
+        .map_err(|e| session_error(format!("cast to ISimpleAudioVolume failed: {e}")))?;
+
+    let instance: SessionInstanceId = Arc::from(instance.as_str());
+
+    let sink: IAudioSessionEvents = SessionEventSink {
+        instance: instance.clone(),
+        tx: ev_tx.clone(),
+    }
+    .into();
+
+    // SAFETY: runs on the core thread. `sink` is moved into the returned
+    // `SessionHandle`, which keeps it alive for as long as the registration
+    // lasts and unregisters it in `Drop`.
+    unsafe { control.RegisterAudioSessionNotification(&sink) }
+        .map_err(|e| session_error(format!("RegisterAudioSessionNotification failed: {e}")))?;
+
+    let handle = SessionHandle {
+        control,
+        volume,
+        sink,
+    };
+
+    let (level, muted) = handle
+        .read_volume()
+        .map_err(|e| session_error(format!("could not read the session volume: {e}")))?;
+
+    let info = SessionInfo {
+        instance,
+        process,
+        endpoint: endpoint.clone(),
+        volume: level,
+        muted,
+    };
+    Ok(Some((info, handle)))
+}
+
+fn session_error(message: String) -> CoreError {
+    CoreError::Other(message)
+}
+
+/// Resolve the identity a profile entry is keyed by.
+///
+/// A protected or elevated process refuses `OpenProcess`, in which case the
+/// executable name is recovered from the session identifier, which embeds the
+/// image path. The last resort is the pid, which is not stable across restarts
+/// and must therefore never be persisted.
+fn resolve_process_key(pid: u32, session_identifier: Option<&str>) -> ProcessKey {
+    if let Some(name) = process_image_name(pid) {
+        return Arc::from(name.as_str());
+    }
+    if let Some(name) = session_identifier.and_then(exe_name_from_session_identifier) {
+        trace!(pid, %name, "process name recovered from the session identifier");
+        return Arc::from(name.as_str());
+    }
+    debug!(
+        pid,
+        "could not resolve a process name, falling back to the pid"
+    );
+    Arc::from(format!("pid:{pid}").as_str())
+}
+
+/// Lower-cased file name of the image backing `pid`, if it can be read.
+fn process_image_name(pid: u32) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+
+    // SAFETY: `OpenProcess` takes only scalars. The returned handle is owned by
+    // this function and is closed on every path below before it returns.
+    let process: HANDLE = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
+        .inspect_err(|e| trace!(pid, error = %e, "OpenProcess failed"))
+        .ok()?;
+
+    let mut buffer = [0u16; IMAGE_PATH_CAPACITY];
+    let mut length = buffer.len() as u32;
+
+    // SAFETY: `process` is a live handle opened just above. `buffer` is a stack
+    // array of `length` UTF-16 units that outlives the call, and `length` is an
+    // in/out parameter: it carries the capacity in and the written length out.
+    let queried = unsafe {
+        QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(buffer.as_mut_ptr()),
+            &mut length,
+        )
+    };
+
+    // SAFETY: `process` was opened by this function, has not been closed yet
+    // and is not used after this point.
+    if let Err(e) = unsafe { CloseHandle(process) } {
+        trace!(pid, error = %e, "CloseHandle failed for a process query handle");
+    }
+
+    queried
+        .inspect_err(|e| trace!(pid, error = %e, "QueryFullProcessImageNameW failed"))
+        .ok()?;
+
+    let length = (length as usize).min(buffer.len());
+    let path = String::from_utf16(&buffer[..length]).ok()?;
+    file_name_lowercase(&path)
+}
+
+/// Recover an executable name from a session identifier.
+///
+/// The identifier looks like
+/// `{0.0.0.0000}.{guid}|\Device\HarddiskVolume4\...\app.exe%b{guid}`: the image
+/// path sits in the last `|`-separated field, followed by a `%b` suffix.
+fn exe_name_from_session_identifier(identifier: &str) -> Option<String> {
+    let tail = identifier.rsplit('|').next()?;
+    let path = tail.split("%b").next().unwrap_or(tail);
+    let name = file_name_lowercase(path)?;
+    name.ends_with(".exe").then_some(name)
+}
+
+/// Last path component, lower-cased. `None` for a path with no file name.
+fn file_name_lowercase(path: &str) -> Option<String> {
+    let name = path.rsplit(['\\', '/']).next()?;
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_lowercase())
+    }
+}
+
+/// Read a COM-allocated wide string and release it with the allocator that
+/// produced it.
+fn take_pwstr(raw: PWSTR) -> Option<String> {
+    if raw.is_null() {
+        return None;
+    }
+    // SAFETY: `raw` is a non-null, NUL-terminated wide string allocated by COM
+    // on our behalf; it is read once here and freed immediately afterwards. No
+    // copy of the pointer outlives this function.
+    let text = unsafe { raw.to_string() };
+    // SAFETY: `raw` has not been freed yet, and freeing it with
+    // `CoTaskMemFree` is the documented ownership contract of the getters that
+    // return it.
+    unsafe { CoTaskMemFree(Some(raw.0 as *const c_void)) };
+    text.ok()
 }
 
 /// Device notification sink.
@@ -612,6 +1389,7 @@ fn endpoint_role(role: ERole) -> Option<Role> {
 mod tests {
     use super::*;
     use crossbeam_channel::unbounded;
+    use windows::Win32::Media::Audio::AudioSessionStateInactive;
 
     const TEST_ID: &str = "{0.0.0.00000000}.{11111111-2222-3333-4444-555555555555}";
 
@@ -698,5 +1476,218 @@ mod tests {
         }
 
         assert!(rx.try_recv().is_err(), "property changes emit no event yet");
+    }
+
+    const TEST_INSTANCE: &str = "{0.0.0.00000000}.{1111}|\\Device\\HarddiskVolume4\\a.exe%b{2222}";
+
+    fn test_sink() -> (IAudioSessionEvents, Receiver<AudioEvent>) {
+        let (tx, rx) = unbounded();
+        let instance: SessionInstanceId = Arc::from(TEST_INSTANCE);
+        let sink: IAudioSessionEvents = SessionEventSink { instance, tx }.into();
+        (sink, rx)
+    }
+
+    /// Echo filtering (R3): a volume change carrying our process-wide event
+    /// context is our own write and must be reported as such; anything else —
+    /// another application's context, or no context at all — is a user action.
+    #[test]
+    fn session_volume_callback_flags_only_our_own_writes() {
+        let ours = init_event_context().expect("event context");
+        let foreign = GUID::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
+        assert_ne!(ours, foreign);
+
+        let (sink, rx) = test_sink();
+
+        // SAFETY: `sink` is our own object, not a foreign one, and both GUIDs
+        // are stack values that outlive the calls — exactly the contract the
+        // audio service follows when it invokes this method.
+        unsafe {
+            sink.OnSimpleVolumeChanged(0.42, false, &ours).unwrap();
+            sink.OnSimpleVolumeChanged(0.13, true, &foreign).unwrap();
+            sink.OnSimpleVolumeChanged(0.99, false, std::ptr::null())
+                .unwrap();
+        }
+
+        let expected = [
+            (0.42_f32, false, true),
+            (0.13, true, false),
+            (0.99, false, false),
+        ];
+        for (volume, muted, own_change) in expected {
+            match rx.try_recv().expect("SessionVolumeChanged") {
+                AudioEvent::SessionVolumeChanged {
+                    instance,
+                    volume: got_volume,
+                    muted: got_muted,
+                    own_change: got_own,
+                } => {
+                    assert_eq!(&*instance, TEST_INSTANCE);
+                    assert_eq!(got_volume, volume);
+                    assert_eq!(got_muted, muted);
+                    assert_eq!(got_own, own_change, "own_change for volume {volume}");
+                }
+                _ => panic!("expected SessionVolumeChanged"),
+            }
+        }
+        assert!(rx.try_recv().is_err(), "no extra events expected");
+    }
+
+    #[test]
+    fn session_state_and_disconnect_callbacks_map_to_events() {
+        let (sink, rx) = test_sink();
+        let text = wide("whatever");
+
+        // SAFETY: our own object; `text` is a NUL-terminated wide string that
+        // outlives every call, and the channel slice is a live stack array.
+        unsafe {
+            sink.OnStateChanged(AudioSessionStateActive).unwrap();
+            sink.OnSessionDisconnected(DisconnectReasonFormatChanged)
+                .unwrap();
+            sink.OnDisplayNameChanged(PCWSTR(text.as_ptr()), std::ptr::null())
+                .unwrap();
+            sink.OnIconPathChanged(PCWSTR(text.as_ptr()), std::ptr::null())
+                .unwrap();
+            sink.OnChannelVolumeChanged(&[0.5_f32, 0.5], 0, std::ptr::null())
+                .unwrap();
+            sink.OnGroupingParamChanged(std::ptr::null(), std::ptr::null())
+                .unwrap();
+        }
+
+        match rx.try_recv().expect("SessionStateChanged") {
+            AudioEvent::SessionStateChanged { instance, state } => {
+                assert_eq!(&*instance, TEST_INSTANCE);
+                assert_eq!(state, SessionState::Active);
+            }
+            _ => panic!("expected SessionStateChanged"),
+        }
+        match rx.try_recv().expect("SessionDisconnected") {
+            AudioEvent::SessionDisconnected { instance, reason } => {
+                assert_eq!(&*instance, TEST_INSTANCE);
+                assert_eq!(reason, DisconnectReason::FormatChanged);
+            }
+            _ => panic!("expected SessionDisconnected"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "display name, icon, per-channel and grouping changes emit no event"
+        );
+    }
+
+    #[test]
+    fn session_notification_callback_ignores_a_null_session() {
+        let (tx, rx) = unbounded::<RawSessionEvent>();
+        let endpoint: EndpointId = Arc::from(TEST_ID);
+        let notifier: IAudioSessionNotification = SessionNotifier { endpoint, tx }.into();
+
+        // SAFETY: our own object; a null session is what the audio service
+        // would pass if it had nothing to announce, and must not be
+        // dereferenced.
+        unsafe {
+            notifier
+                .OnSessionCreated(None::<&IAudioSessionControl>)
+                .unwrap();
+        }
+
+        assert!(rx.try_recv().is_err(), "a null session enqueues nothing");
+    }
+
+    #[test]
+    fn session_state_conversion_covers_every_documented_value() {
+        assert_eq!(
+            SessionState::from(AudioSessionStateActive),
+            SessionState::Active
+        );
+        assert_eq!(
+            SessionState::from(AudioSessionStateInactive),
+            SessionState::Inactive
+        );
+        assert_eq!(
+            SessionState::from(AudioSessionStateExpired),
+            SessionState::Expired
+        );
+        assert_eq!(
+            SessionState::from(AudioSessionState(99)),
+            SessionState::Inactive,
+            "an unknown state must not be reported as active"
+        );
+    }
+
+    #[test]
+    fn disconnect_reason_conversion_covers_every_documented_value() {
+        let pairs = [
+            (
+                DisconnectReasonDeviceRemoval,
+                DisconnectReason::DeviceRemoval,
+            ),
+            (
+                DisconnectReasonServerShutdown,
+                DisconnectReason::ServerShutdown,
+            ),
+            (
+                DisconnectReasonFormatChanged,
+                DisconnectReason::FormatChanged,
+            ),
+            (
+                DisconnectReasonSessionLogoff,
+                DisconnectReason::SessionLogoff,
+            ),
+            (
+                DisconnectReasonSessionDisconnected,
+                DisconnectReason::SessionDisconnected,
+            ),
+            (
+                DisconnectReasonExclusiveModeOverride,
+                DisconnectReason::ExclusiveModeOverride,
+            ),
+        ];
+        for (raw, expected) in pairs {
+            assert_eq!(DisconnectReason::from(raw), expected);
+        }
+        assert_eq!(
+            DisconnectReason::from(AudioSessionDisconnectReason(99)),
+            DisconnectReason::ServerShutdown
+        );
+    }
+
+    #[test]
+    fn process_key_falls_back_to_the_session_identifier_then_to_the_pid() {
+        // pid 0 is never a real application session, so `OpenProcess` is not
+        // even attempted and the identifier is used instead.
+        let identifier =
+            "{0.0.0.00000000}.{abcd}|\\Device\\HarddiskVolume4\\Program Files\\Spotify\\Spotify.EXE%b{ef01}";
+        assert_eq!(&*resolve_process_key(0, Some(identifier)), "spotify.exe");
+        assert_eq!(&*resolve_process_key(0, None), "pid:0");
+        assert_eq!(&*resolve_process_key(0, Some("no path here")), "pid:0");
+    }
+
+    #[test]
+    fn executable_name_is_recovered_from_a_session_identifier() {
+        assert_eq!(
+            exe_name_from_session_identifier("{0.0.0}.{1}|\\Device\\Harddisk\\Chrome.exe%b{2}")
+                .as_deref(),
+            Some("chrome.exe")
+        );
+        assert_eq!(
+            exe_name_from_session_identifier("{0.0.0}.{1}|\\Device\\Harddisk\\Chrome.exe")
+                .as_deref(),
+            Some("chrome.exe")
+        );
+        assert_eq!(
+            exe_name_from_session_identifier("{0.0.0}.{1}|\\Device\\Harddisk\\something%b{2}"),
+            None,
+            "only an .exe path is a usable process key"
+        );
+        assert_eq!(exe_name_from_session_identifier(""), None);
+    }
+
+    #[test]
+    fn file_names_are_lowercased_and_stripped_of_their_directory() {
+        assert_eq!(
+            file_name_lowercase("C:\\Program Files\\App\\App.EXE").as_deref(),
+            Some("app.exe")
+        );
+        assert_eq!(file_name_lowercase("App.exe").as_deref(), Some("app.exe"));
+        assert_eq!(file_name_lowercase("C:\\dir\\"), None);
+        assert_eq!(file_name_lowercase(""), None);
     }
 }

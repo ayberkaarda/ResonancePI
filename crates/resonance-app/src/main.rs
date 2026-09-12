@@ -1,8 +1,8 @@
 //! Resonance binary.
 //!
 //! At this stage the only thing it can do is `--dump-events`: start the audio
-//! core, print the active render endpoints, and then print every device event
-//! the core reports until the process is interrupted with Ctrl+C.
+//! core, print the active render endpoints, and then print every device and
+//! session event the core reports until the process is interrupted with Ctrl+C.
 
 use std::process::ExitCode;
 
@@ -19,7 +19,7 @@ USAGE:
 
 OPTIONS:
     --dump-events    Print the active render endpoints, then stream audio device
-                     events to stdout until interrupted (Ctrl+C).
+                     and session events to stdout until interrupted (Ctrl+C).
     -h, --help       Show this message.
 
 ENVIRONMENT:
@@ -84,8 +84,9 @@ fn dump_events_mode() -> ExitCode {
     print_startup(core.startup());
 
     println!();
-    println!("listening for device events (Ctrl+C to exit)");
-    println!("try: plug/unplug a device, or change the default output in Windows sound settings");
+    println!("listening for device and session events (Ctrl+C to exit)");
+    println!("try: plug/unplug a device, change the default output in Windows sound settings,");
+    println!("     or move an application's slider in the Windows volume mixer");
     println!();
 
     for event in ev_rx.iter() {

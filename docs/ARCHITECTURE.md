@@ -164,5 +164,20 @@ a profile and observing our own write).
   `_Impl` vtable directly) — end-to-end delivery from a real device
   plug/unplug or default-device change has not yet been observed and
   needs a manual check.
-- **Session hooking, default-endpoint switching, state manager,
-  persistence, overlay UI:** not started.
+- **Session hooking:** done. Per-endpoint `IAudioSessionManager2` activated
+  on every active render endpoint, `IAudioSessionNotification` registered
+  (with the `GetSessionEnumerator`/`GetCount` call required to actually
+  start receiving notifications), each session hooked with
+  `IAudioSessionEvents`, process key resolved via
+  `OpenProcess`/`QueryFullProcessImageNameW` with the documented
+  fallbacks, volume writes tagged with a process-wide event-context GUID
+  so the reducer can tell its own writes apart from user-initiated ones.
+  Verified against a real running session (Spotify): a volume change made
+  by a separate process was correctly observed as `own_change: false`;
+  `own_change: true` is verified at the unit-test level (driving the
+  callback's real vtable with the real event-context pointer) rather than
+  end-to-end, since nothing yet issues `ApplySessionVolume` outside a
+  test. Long-run session-registry cleanup (many open/close cycles) has
+  not been observed.
+- **Default-endpoint switching, state manager, persistence, overlay UI:**
+  not started.

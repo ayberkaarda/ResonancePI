@@ -38,15 +38,21 @@ call site.
 - `resonance-core` owns every COM interface pointer; `Drop` runs there.
   `resonance-state` stays free of `windows`/`windows-sys` dependencies so
   it compiles and tests on any OS.
-- **Important correction to the original framing:** the `windows` crate's
-  COM wrapper types are marked `Send + Sync`. Moving a COM pointer to
-  another thread is **not a compile error** — Rust does not eliminate the
-  cross-thread COM risk by itself. The actual guarantee comes from
-  architecture discipline: all COM pointers are held only inside the
-  audio-core module, owned by a single dedicated thread, and nothing else
-  ever touches them. This is a weaker but still meaningful protection than
-  "the compiler rejects it", and future contributors should not assume the
-  stronger claim.
+- **Measured, not assumed:** the `windows` crate's COM wrapper types are
+  *not* `Send` by default in the pinned version. Moving a COM interface
+  pointer to another thread through an ordinary channel is a genuine
+  compile error (`E0277`, confirmed while implementing session hooking).
+  This is closer to the original framing above than an earlier draft of
+  this document assumed. The protection is not unconditional, though: a
+  handful of places legitimately need to move an owned COM pointer between
+  two threads of the *same* multi-threaded apartment (for example, handing
+  a freshly created audio session from the thread that received the
+  creation notification to the dedicated audio-core thread). Those cases
+  use a one-line wrapper type with an explicit `unsafe impl Send`, whose
+  safety comment states which two threads are involved, that both belong
+  to the same apartment, and which of them runs the eventual `Drop`. That
+  wrapper makes each such crossing visible and individually justified,
+  rather than relying on it being safe in general.
 - Every `unsafe` block requires a comment stating the thread, apartment,
   and pointer-lifetime invariant it relies on.
 - Every COM method signature is verified against the pinned `windows`
