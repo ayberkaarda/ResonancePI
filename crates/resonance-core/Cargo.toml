@@ -22,3 +22,7 @@ tracing = "0.1"
 [features]
 default = ["com-backend"]
 com-backend = ["dep:windows", "dep:windows-core"]
+# Default endpoint switching through the undocumented IPolicyConfig interface.
+# Off by default: it is unsupported API that a Windows update may change or
+# withdraw, so a build without it keeps profiles working and drops switching.
+switching = ["com-backend"]

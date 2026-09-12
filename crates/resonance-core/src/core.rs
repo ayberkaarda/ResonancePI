@@ -58,8 +58,10 @@ use windows_core::{
 
 use crate::messages::{
     AudioEvent, CoreCommand, CoreError, DataFlow, DisconnectReason, EndpointId, EndpointState,
-    EndpointView, ProcessKey, Role, SessionInfo, SessionInstanceId, SessionState,
+    EndpointView, ProcessKey, Role, RoleSet, SessionInfo, SessionInstanceId, SessionState,
 };
+#[cfg(feature = "switching")]
+use crate::policy_config::PolicyConfig;
 
 /// The role reported as "the" default render endpoint at startup. Windows'
 /// "Default Device" in the sound control panel maps to the console role.
@@ -296,6 +298,14 @@ struct AudioCore {
     ev_tx: Sender<AudioEvent>,
     /// Internal handoff channel handed to every `SessionNotifier`.
     raw_tx: Sender<RawSessionEvent>,
+    /// Default endpoint switching, when it is both compiled in and available on
+    /// this machine.
+    ///
+    /// `None` means the startup check could not create the undocumented
+    /// `PolicyConfigClient`; the core then runs in "profiles only" mode, where
+    /// switching requests are logged and dropped instead of failing.
+    #[cfg(feature = "switching")]
+    policy: Option<PolicyConfig>,
 }
 
 impl AudioCore {
@@ -328,6 +338,8 @@ impl AudioCore {
             endpoints: HashMap::new(),
             ev_tx,
             raw_tx,
+            #[cfg(feature = "switching")]
+            policy: probe_policy_config(),
         })
     }
 
@@ -563,6 +575,30 @@ impl AudioCore {
         }
     }
 
+    /// Make `id` the default render endpoint for the selected roles.
+    ///
+    /// Switching is unsupported API, so every failure short of a panic is a log
+    /// line: a machine where `IPolicyConfig` is missing still records and
+    /// restores profiles, it just cannot change the default device itself.
+    #[cfg(feature = "switching")]
+    fn set_default_endpoint(&self, id: &EndpointId, roles: RoleSet) {
+        let Some(policy) = self.policy.as_ref() else {
+            warn!(%id, "SetDefaultEndpoint ignored: switching unavailable (IPolicyConfig unsupported on this system)");
+            return;
+        };
+        match policy.set_default(id, roles) {
+            Ok(()) => debug!(%id, ?roles, "default endpoint switch requested"),
+            Err(e) => warn!(%id, ?roles, error = %e, "SetDefaultEndpoint failed"),
+        }
+    }
+
+    /// Without the `switching` feature the core has no way to change the default
+    /// endpoint, so the request is logged and dropped.
+    #[cfg(not(feature = "switching"))]
+    fn set_default_endpoint(&self, id: &EndpointId, _roles: RoleSet) {
+        warn!(%id, "SetDefaultEndpoint ignored: built without the `switching` feature");
+    }
+
     fn handle(&mut self, command: CoreCommand) {
         match command {
             CoreCommand::Shutdown => {}
@@ -571,10 +607,33 @@ impl AudioCore {
                 volume,
                 muted,
             } => self.apply_session_volume(&instance, volume, muted),
-            CoreCommand::SetDefaultEndpoint { .. } => {
-                warn!("SetDefaultEndpoint ignored: endpoint switching is not implemented yet");
-            }
+            CoreCommand::SetDefaultEndpoint { id, roles } => self.set_default_endpoint(&id, roles),
             CoreCommand::ResyncEndpoint(id) => self.resync_endpoint(&id),
+        }
+    }
+}
+
+/// Startup smoke check for default endpoint switching.
+///
+/// Creating the undocumented `PolicyConfigClient` once at startup is what tells
+/// us whether switching can work at all on this machine: the call fails if the
+/// coclass is not registered or no longer answers to the interface id, which is
+/// how a Windows release that withdrew the interface would present itself. A
+/// success does not prove the vtable slots are still in the expected order —
+/// only a real switch can show that — so it is a liveness check, not a
+/// correctness proof.
+///
+/// Runs on the audio core thread; the returned object never leaves it.
+#[cfg(feature = "switching")]
+fn probe_policy_config() -> Option<PolicyConfig> {
+    match PolicyConfig::new() {
+        Ok(policy) => {
+            debug!("IPolicyConfig available, default endpoint switching is enabled");
+            Some(policy)
+        }
+        Err(e) => {
+            warn!(error = %e, "IPolicyConfig unavailable, continuing without default endpoint switching");
+            None
         }
     }
 }

@@ -11,7 +11,9 @@ use std::thread;
 
 use crossbeam_channel::{unbounded, Sender};
 use resonance_core::core::{self, CoreStartup};
-use resonance_core::messages::{AudioEvent, CoreCommand, CoreError, ProcessKey, SessionInstanceId};
+use resonance_core::messages::{
+    AudioEvent, CoreCommand, CoreError, EndpointView, ProcessKey, RoleSet, SessionInstanceId,
+};
 use tracing_subscriber::EnvFilter;
 
 const USAGE: &str = "\
@@ -100,14 +102,20 @@ fn dump_events_mode() -> ExitCode {
     println!("commands (type at the prompt below, then Enter):");
     println!("  list                                             list known sessions");
     println!("  vol <instance-prefix> <0.0-1.0> mute|unmute       send ApplySessionVolume");
+    println!("  endpoints                                         list known render endpoints");
+    println!(
+        "  switch <index-or-id-prefix>                       send SetDefaultEndpoint (all roles)"
+    );
     println!("  help                                              show this again");
     println!();
 
     let sessions: Arc<Mutex<Vec<SessionSnapshot>>> = Arc::new(Mutex::new(Vec::new()));
+    let endpoints: Arc<[EndpointView]> = startup_endpoints_snapshot(core.startup());
 
     let stdin_sessions = Arc::clone(&sessions);
+    let stdin_endpoints = Arc::clone(&endpoints);
     let stdin_cmd_tx = cmd_tx.clone();
-    thread::spawn(move || read_commands(stdin_cmd_tx, stdin_sessions));
+    thread::spawn(move || read_commands(stdin_cmd_tx, stdin_sessions, stdin_endpoints));
 
     for event in ev_rx.iter() {
         println!("{}", describe_event(&event));
@@ -149,7 +157,15 @@ fn update_sessions(sessions: &Arc<Mutex<Vec<SessionSnapshot>>>, event: &AudioEve
     }
 }
 
-fn read_commands(cmd_tx: Sender<CoreCommand>, sessions: Arc<Mutex<Vec<SessionSnapshot>>>) {
+fn startup_endpoints_snapshot(startup: &CoreStartup) -> Arc<[EndpointView]> {
+    startup.endpoints.clone().into()
+}
+
+fn read_commands(
+    cmd_tx: Sender<CoreCommand>,
+    sessions: Arc<Mutex<Vec<SessionSnapshot>>>,
+    endpoints: Arc<[EndpointView]>,
+) {
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
         let line = match line {
@@ -165,6 +181,7 @@ fn read_commands(cmd_tx: Sender<CoreCommand>, sessions: Arc<Mutex<Vec<SessionSna
         match parts.next() {
             Some("help") => print_command_help(),
             Some("list") => print_session_list(&sessions),
+            Some("endpoints") => print_endpoint_list(&endpoints),
             Some("quit") => {
                 let _ = cmd_tx.send(CoreCommand::Shutdown);
                 break;
@@ -172,6 +189,10 @@ fn read_commands(cmd_tx: Sender<CoreCommand>, sessions: Arc<Mutex<Vec<SessionSna
             Some("vol") => {
                 let rest: Vec<&str> = parts.collect();
                 handle_vol_command(&cmd_tx, &sessions, &rest);
+            }
+            Some("switch") => {
+                let rest: Vec<&str> = parts.collect();
+                handle_switch_command(&cmd_tx, &endpoints, &rest);
             }
             _ => println!("unknown command, type 'help' for the command list"),
         }
@@ -243,14 +264,82 @@ fn resolve_instance(
     }
 }
 
+fn handle_switch_command(cmd_tx: &Sender<CoreCommand>, endpoints: &[EndpointView], args: &[&str]) {
+    let [target] = args else {
+        println!("usage: switch <index-or-id-prefix>");
+        return;
+    };
+
+    let endpoint = match resolve_endpoint(endpoints, target) {
+        Ok(endpoint) => endpoint,
+        Err(message) => {
+            println!("{message}");
+            return;
+        }
+    };
+
+    let _ = cmd_tx.send(CoreCommand::SetDefaultEndpoint {
+        id: endpoint.id.clone(),
+        roles: RoleSet::all(),
+    });
+    println!(
+        "sent SetDefaultEndpoint id={} ({})",
+        endpoint.id, endpoint.friendly_name
+    );
+}
+
+fn resolve_endpoint<'a>(
+    endpoints: &'a [EndpointView],
+    target: &str,
+) -> Result<&'a EndpointView, String> {
+    if let Ok(index) = target.parse::<usize>() {
+        if let Some(endpoint) = endpoints.get(index) {
+            return Ok(endpoint);
+        }
+    }
+
+    if let Some(exact) = endpoints.iter().find(|e| e.id.as_ref() == target) {
+        return Ok(exact);
+    }
+
+    let matches: Vec<&EndpointView> = endpoints
+        .iter()
+        .filter(|e| e.id.starts_with(target))
+        .collect();
+
+    match matches.as_slice() {
+        [] => Err("error: unknown endpoint index or id prefix, try 'endpoints'".to_string()),
+        [only] => Ok(only),
+        _ => Err("error: ambiguous endpoint id prefix, be more specific".to_string()),
+    }
+}
+
 fn print_command_help() {
     println!("commands:");
     println!("  list                                             list known sessions");
     println!("  vol <instance-prefix> <0.0-1.0> mute|unmute       send ApplySessionVolume");
+    println!("  endpoints                                         list known render endpoints");
+    println!(
+        "  switch <index-or-id-prefix>                       send SetDefaultEndpoint (all roles)"
+    );
     println!(
         "  quit                                              send Shutdown and stop reading input"
     );
     println!("  help                                              show this message");
+}
+
+fn print_endpoint_list(endpoints: &[EndpointView]) {
+    if endpoints.is_empty() {
+        println!("no known endpoints");
+        return;
+    }
+    println!("known render endpoints ({}):", endpoints.len());
+    for (index, endpoint) in endpoints.iter().enumerate() {
+        println!(
+            "  [{index}] {} id={} state={:?}",
+            endpoint.friendly_name, endpoint.id, endpoint.state
+        );
+    }
 }
 
 fn print_session_list(sessions: &Arc<Mutex<Vec<SessionSnapshot>>>) {
