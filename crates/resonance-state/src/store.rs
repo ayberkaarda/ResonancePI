@@ -64,17 +64,53 @@ pub struct SessionEntry {
     pub updated_at: SystemTime,
 }
 
+/// Every field of [`Settings`] carries a serde default so that a stored
+/// document written by an older build — one that predates a field being added
+/// — still deserializes instead of failing the *whole* document with a
+/// "missing field" error. That failure mode is not local to the settings
+/// object: `Settings` is nested inside [`ProfileStore`], so one unknown-to-the-
+/// old-file field would reject the user's entire saved profile set and hand the
+/// caller an empty store, which a subsequent save would then write over the
+/// real data. Missing keys must therefore degrade to the same values
+/// `Settings::default()` produces — not to the field type's zero value, which
+/// for `overlay_opacity` would be a nearly invisible overlay, for
+/// `prune_after_days` would prune everything immediately, and for
+/// `switch_roles` would silently switch no roles at all.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
-    #[serde(with = "role_set")]
+    #[serde(default = "default_switch_roles", with = "role_set")]
     pub switch_roles: RoleSet,
+    #[serde(default)]
     pub overlay_position: Option<(f32, f32)>,
+    #[serde(default = "default_overlay_opacity")]
     pub overlay_opacity: f32,
+    #[serde(default)]
     pub autostart: bool,
     /// Drop entries not seen for N days (default 90).
+    #[serde(default = "default_prune_after_days")]
     pub prune_after_days: u32,
-    #[serde(with = "hotkey_config")]
+    #[serde(default, with = "hotkey_config")]
     pub hotkey: HotkeyConfig,
+}
+
+/// Matches `Settings::default()`. `RoleSet` derives `Default`, but that
+/// derive yields all-`false` (switch no roles), whereas the product default is
+/// `RoleSet::all()` — so a bare `#[serde(default)]` on that field would be
+/// silently wrong rather than a compile error.
+fn default_switch_roles() -> RoleSet {
+    RoleSet::all()
+}
+
+/// Matches `Settings::default()`; `f32::default()` is `0.0`, a fully
+/// transparent overlay.
+fn default_overlay_opacity() -> f32 {
+    0.9
+}
+
+/// Matches `Settings::default()`; `u32::default()` is `0`, which would treat
+/// every stored entry as immediately prunable.
+fn default_prune_after_days() -> u32 {
+    90
 }
 
 impl Default for Settings {
@@ -283,6 +319,162 @@ mod tests {
         let json = serde_json::to_string(&settings).expect("serialize");
         let decoded: Settings = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(settings, decoded);
+    }
+
+    /// A document written before `hotkey` existed as a field must still load.
+    /// Before every `Settings` field carried a serde default, the missing key
+    /// failed deserialization of the *whole* `ProfileStore`, so the repository
+    /// treated a perfectly good file as corrupt and fell back to an empty
+    /// store — discarding every saved per-application volume.
+    #[test]
+    fn profile_store_from_document_without_hotkey_key_loads() {
+        let json = r#"{
+            "schema_version": 1,
+            "endpoints": {
+                "{endpoint-guid}": {
+                    "friendly_name": "Speakers",
+                    "last_seen": { "secs": 1726000000, "nanos": 0 },
+                    "sessions": {
+                        "spotify.exe": {
+                            "volume": 0.1,
+                            "muted": false,
+                            "updated_at": { "secs": 1726000000, "nanos": 0 }
+                        }
+                    }
+                }
+            },
+            "settings": {
+                "switch_roles": {
+                    "console": true,
+                    "multimedia": false,
+                    "communications": true
+                },
+                "overlay_position": [120.0, 240.0],
+                "overlay_opacity": 0.75,
+                "autostart": true,
+                "prune_after_days": 30
+            }
+        }"#;
+
+        let store: ProfileStore = serde_json::from_str(json).expect("deserialize");
+
+        // The one absent field falls back to the product default.
+        assert_eq!(store.settings.hotkey, HotkeyConfig::default());
+
+        // Everything present is taken from the document, not from
+        // `Settings::default()` — the fallback must be per field, not wholesale.
+        assert_eq!(
+            store.settings.switch_roles,
+            RoleSet {
+                console: true,
+                multimedia: false,
+                communications: true,
+            }
+        );
+        assert_eq!(store.settings.overlay_position, Some((120.0, 240.0)));
+        assert_eq!(store.settings.overlay_opacity, 0.75);
+        assert!(store.settings.autostart);
+        assert_eq!(store.settings.prune_after_days, 30);
+
+        // And the real payload survives.
+        let endpoint = store
+            .endpoints
+            .get(&EndpointId::from("{endpoint-guid}"))
+            .expect("endpoint preserved");
+        assert_eq!(endpoint.friendly_name, "Speakers");
+        assert_eq!(
+            endpoint
+                .sessions
+                .get(&ProcessKey::from("spotify.exe"))
+                .expect("session preserved")
+                .volume,
+            0.1
+        );
+    }
+
+    /// Each omitted key must fall back to the value `Settings::default()` uses,
+    /// which for these fields is *not* the field type's zero value. Pinning the
+    /// exact values here because a wrong fallback compiles cleanly and would
+    /// only show up as an invisible overlay or as profile entries pruned on
+    /// sight.
+    #[test]
+    fn settings_missing_keys_fall_back_to_product_defaults() {
+        let settings: Settings = serde_json::from_str("{}").expect("deserialize empty settings");
+
+        assert_eq!(settings.switch_roles, RoleSet::all());
+        assert_ne!(settings.switch_roles, RoleSet::default());
+        assert_eq!(settings.overlay_opacity, 0.9);
+        assert_eq!(settings.prune_after_days, 90);
+        assert_eq!(settings.overlay_position, None);
+        assert!(!settings.autostart);
+        assert_eq!(settings.hotkey, HotkeyConfig::default());
+        assert_eq!(settings, Settings::default());
+    }
+
+    /// Omitting one key at a time must leave the other fields alone.
+    #[test]
+    fn settings_single_missing_key_defaults_only_that_field() {
+        let without_opacity: Settings = serde_json::from_str(
+            r#"{
+                "switch_roles": {
+                    "console": false,
+                    "multimedia": true,
+                    "communications": false
+                },
+                "overlay_position": null,
+                "autostart": true,
+                "prune_after_days": 7
+            }"#,
+        )
+        .expect("deserialize");
+        assert_eq!(without_opacity.overlay_opacity, 0.9);
+        assert_eq!(without_opacity.prune_after_days, 7);
+        assert!(without_opacity.autostart);
+        assert_eq!(
+            without_opacity.switch_roles,
+            RoleSet {
+                console: false,
+                multimedia: true,
+                communications: false,
+            }
+        );
+
+        let without_prune: Settings = serde_json::from_str(
+            r#"{
+                "overlay_opacity": 0.25,
+                "autostart": false
+            }"#,
+        )
+        .expect("deserialize");
+        assert_eq!(without_prune.prune_after_days, 90);
+        assert_eq!(without_prune.overlay_opacity, 0.25);
+        assert_eq!(without_prune.switch_roles, RoleSet::all());
+    }
+
+    /// `#[serde(default = "...")]` composes with `#[serde(with = "...")]`: the
+    /// default is used only when the key is absent, and the `with` module's
+    /// deserializer is used whenever it is present.
+    #[test]
+    fn settings_present_role_set_key_still_uses_the_shim_deserializer() {
+        let settings: Settings = serde_json::from_str(
+            r#"{
+                "switch_roles": {
+                    "console": false,
+                    "multimedia": false,
+                    "communications": true
+                }
+            }"#,
+        )
+        .expect("deserialize");
+        assert_eq!(
+            settings.switch_roles,
+            RoleSet {
+                console: false,
+                multimedia: false,
+                communications: true,
+            }
+        );
+        assert_eq!(settings.hotkey, HotkeyConfig::default());
     }
 
     #[test]
