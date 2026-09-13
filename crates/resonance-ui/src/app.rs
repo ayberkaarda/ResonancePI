@@ -123,6 +123,13 @@ impl ResonanceApp {
             match signal {
                 // The overlay is already open, so toggling means dismiss it.
                 UiSignal::ToggleOverlay => Self::close(ctx),
+                // The corner widget's window belongs to the loop outside this
+                // one, which is blocked for as long as the overlay is up and
+                // so cannot act on these. They are dropped rather than held:
+                // the overlay the user is already looking at is the thing the
+                // widget opens, and both ways of raising these — the tray menu
+                // and the widget's own menu — are still there afterwards.
+                UiSignal::ShowWidget | UiSignal::HideWidget => {}
                 UiSignal::Quit => self.quit(ctx),
             }
         }

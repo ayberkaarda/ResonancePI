@@ -21,7 +21,7 @@ use tracing::{debug, info, warn};
 
 use resonance_core::core::{self, CoreStartup, CoreThread};
 use resonance_core::messages::{
-    AudioEvent, CoreCommand, CoreError, HotkeyConfig, Snapshot, UiCommand,
+    AudioEvent, CoreCommand, CoreError, DataFlow, HotkeyConfig, Role, Snapshot, UiCommand,
 };
 use resonance_state::{
     Dispatch, JsonFileRepository, PersistRequest, PersistResult, ProfileRepository, RepoError,
@@ -101,6 +101,18 @@ pub struct BackendHandles {
     /// Startup tab does exactly that) while this stored value still says the
     /// user wanted it on.
     pub initial_autostart: bool,
+    /// The corner widget's visibility as loaded from the profile store.
+    ///
+    /// Read here for the same reason as `initial_hotkey`: a UI needs it to
+    /// know whether to show the corner widget before any `Snapshot` has
+    /// arrived.
+    pub initial_widget_visible: bool,
+    /// The corner widget's last dragged-to position as loaded from the
+    /// profile store.
+    ///
+    /// Read here for the same reason as `initial_hotkey`: a UI needs it to
+    /// place the corner widget before any `Snapshot` has arrived.
+    pub initial_widget_position: Option<(f32, f32)>,
 
     core: CoreThread,
     reducer: JoinHandle<()>,
@@ -196,7 +208,7 @@ pub fn spawn_backend() -> Result<BackendHandles, BackendError> {
     // file on disk is the only thing actually shared, and it is only ever
     // written from the persistence thread).
     let load_repo = JsonFileRepository::new(store_path.clone());
-    let state_manager = StateManager::new(&load_repo);
+    let mut state_manager = StateManager::new(&load_repo);
     if let Some(err) = state_manager.load_error() {
         warn!(error = %err, "profile store failed to load, starting from an empty store");
     }
@@ -205,6 +217,8 @@ pub fn spawn_backend() -> Result<BackendHandles, BackendError> {
     // reducer thread exists to publish anything.
     let initial_hotkey = state_manager.settings().hotkey;
     let initial_autostart = state_manager.settings().autostart;
+    let initial_widget_visible = state_manager.settings().widget_visible;
+    let initial_widget_position = state_manager.settings().widget_position;
     let save_repo = JsonFileRepository::new(store_path);
 
     let (cmd_tx, cmd_rx) = unbounded::<CoreCommand>();
@@ -218,6 +232,7 @@ pub fn spawn_backend() -> Result<BackendHandles, BackendError> {
 
     let core = core::spawn(cmd_rx, ev_tx).map_err(BackendError::Core)?;
     let startup = core.startup().clone();
+    seed_startup_state(&mut state_manager, &startup, &cmd_tx);
 
     let persistence = thread::Builder::new()
         .name("resonance-persistence".to_owned())
@@ -247,12 +262,73 @@ pub fn spawn_backend() -> Result<BackendHandles, BackendError> {
         snapshot_rx,
         initial_hotkey,
         initial_autostart,
+        initial_widget_visible,
+        initial_widget_position,
         core,
         reducer,
         persistence,
         shutdown_tx,
         flush_ack_rx,
     })
+}
+
+/// Folds the audio core's bootstrap snapshot into a freshly-built
+/// `StateManager`, before it is handed to the reducer thread.
+///
+/// The core enumerates the render endpoints and reads the current default
+/// device once, during its own bootstrap, and reports the result through
+/// `CoreStartup`. It does *not* replay that enumeration as events: the
+/// `AudioEvent` stream only carries what changes after the core is armed. So
+/// without this step the state manager's live view starts empty and stays
+/// empty until the user happens to plug a device in or switch the default —
+/// on a fresh launch the read model would report no endpoints at all while
+/// the machine has several.
+///
+/// This runs synchronously, on the caller's thread, before `state` is moved
+/// into the reducer thread. Routing it through the event channel instead
+/// would leave the reducer's first published `Snapshot` racing the seed for
+/// no benefit; here the first snapshot the reducer publishes already has the
+/// endpoints in it.
+///
+/// Live sessions are deliberately not seeded. They are not part of
+/// `CoreStartup`: the core hooks each endpoint's existing sessions during the
+/// same bootstrap and announces every one of them as a normal
+/// `SessionCreated` event, which is already queued on the event channel by
+/// the time this runs.
+fn seed_startup_state(
+    state: &mut StateManager,
+    startup: &CoreStartup,
+    cmd_tx: &Sender<CoreCommand>,
+) {
+    // Endpoints first: the default handler below records the endpoint's
+    // display name into its stored profile by reading the live view, so the
+    // endpoint has to be live before the default is applied.
+    for endpoint in &startup.endpoints {
+        let dispatches = state.handle_audio_event(AudioEvent::EndpointAdded {
+            id: endpoint.id.clone(),
+            friendly_name: endpoint.friendly_name.clone(),
+        });
+        apply_dispatches(state, dispatches, cmd_tx);
+    }
+
+    // `Role::Multimedia` is not a free choice: the reducer coalesces the three
+    // roles Windows reports separately by treating multimedia as the single
+    // trigger and ignoring the rest, so any other role would be discarded
+    // without a trace.
+    if let Some(id) = &startup.default_render {
+        let dispatches = state.handle_audio_event(AudioEvent::DefaultEndpointChanged {
+            flow: DataFlow::Render,
+            role: Role::Multimedia,
+            id: Some(id.clone()),
+        });
+        apply_dispatches(state, dispatches, cmd_tx);
+    }
+
+    debug!(
+        endpoints = startup.endpoints.len(),
+        default = startup.default_render.as_deref().unwrap_or("<none>"),
+        "seeded the state manager from the audio core's bootstrap snapshot"
+    );
 }
 
 /// Persistence thread body: the only thread that ever calls
@@ -460,7 +536,9 @@ fn log_audio_event(event: &AudioEvent) {
         AudioEvent::EndpointStateChanged { id, state } => {
             debug!(%id, ?state, "EndpointStateChanged");
         }
-        AudioEvent::EndpointAdded(id) => debug!(%id, "EndpointAdded"),
+        AudioEvent::EndpointAdded { id, friendly_name } => {
+            debug!(%id, %friendly_name, "EndpointAdded");
+        }
         AudioEvent::EndpointRemoved(id) => debug!(%id, "EndpointRemoved"),
         AudioEvent::SessionCreated { endpoint, session } => {
             debug!(%endpoint, process = %session.process, instance = %session.instance, "SessionCreated");

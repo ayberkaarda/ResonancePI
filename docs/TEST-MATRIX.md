@@ -60,6 +60,41 @@ marked accordingly.
 | Release build succeeds with the pinned profile | `cargo build --release` | Succeeds; `resonance-app.exe` is 5.49 MB (`lto="fat"`, `codegen-units=1`, `panic="abort"`, `strip=true`, `opt-level=3` core / `"z"` for `resonance-ui`, all unchanged from the pinned profile) |
 | A pid-keyed session (protected/UWP process whose real identity couldn't be resolved) is not persisted | Unit-tested in `resonance-state`, event-driven (a `SessionCreated` with a `pid:<n>` process key) | Confirmed: no entry reaches the persisted store, the live view is unaffected, and the write-behind debounce is not armed by it |
 
+## Corner widget
+
+| Test | Method | Result |
+|---|---|---|
+| Widget appears on screen by default | Fresh launch, `--overlay`, screenshot of the corner | Visible bottom-right of the primary monitor's work area, 16 px margin, correctly rendered (real per-pixel transparency confirmed, not a black/garbled rectangle) |
+| Left-click opens the full overlay panel | Synthetic left-click on the widget, screenshot | Panel opened, same as the global shortcut / tray "Toggle overlay" |
+| Right-click shows a "Hide" menu, selecting it hides the widget | Synthetic right-click + click on "Hide" (overlay panel confirmed closed first — see note below) | Widget window's visibility confirmed `False` afterward |
+| "Show icon" (tray menu) brings a hidden widget back | Verified by the implementing agent via direct show()/hide() probing (cross-thread message-based, not requiring a live message-driven click) | Centre pixel of the widget's window transitioned black → icon color → black → icon color across spawn-hidden → show() → hide() → show() → drop, confirming both the setting and the live window respond correctly |
+| Widget visibility setting persists and defaults correctly | Unit-tested in `resonance-state` (`Settings.widget_visible`, missing-key defaults to `true`) | Confirmed — a document missing the key still gets a visible widget, not a hidden one (the type-level default for `bool` is `false`, which would have been the wrong, silent default here) |
+
+**Known limitation (documented, not fixed in this pass):** while the full overlay panel is open, the tray's "Show icon" and the widget's own "Hide" are silently dropped rather than queued — the thread that would act on them is blocked running the panel's own event loop for as long as it's open. Both controls work normally again as soon as the panel is closed. A first attempt at reproducing this during manual verification produced a false alarm (automation clicked the wrong pixel), which is a reminder that this specific limitation is real but narrow, not a general "hide/show is broken" issue — the retest with the panel confirmed closed worked correctly on the first precise click.
+
+## Corner widget v2 — drag and live endpoint list
+
+Added after the operator asked for hover-to-expand and drag-to-reposition, on top of the static-icon widget above (see ADR-0005's revision).
+
+| Test | Method | Result |
+|---|---|---|
+| Hover grows the widget into a live endpoint list | Real backend, real hardware, hover over the at-rest icon | Grew to the exact size for the real endpoint count (3 rows measured), each showing the endpoint's real friendly name (not a placeholder) |
+| Row click switches the default endpoint directly, without opening the panel | Clicked a non-default row | `UiCommand::SwitchEndpoint` sent with the correct endpoint id (verified against the log); panel did not open |
+| Plain click at rest still opens the panel | Click without moving past the drag threshold | `UiSignal::ToggleOverlay`, same as the v1 widget |
+| Drag repositions the widget and persists the new position | Press-hold on the at-rest icon, move, release | Window followed the cursor; `Settings.widget_position` ended up holding the exact expected value (cursor position minus the grab offset), confirmed by reading it back from the real store file and by a fresh relaunch restoring to that exact position |
+| Right-click "Hide" still works in both states | Right-click at rest and while grown | Menu appears in both; selecting "Hide" hides the widget (confirmed via the live window's visibility, not just a screenshot) |
+
+**Known cosmetic issue (not fixed, low severity):** right-clicking while the widget is grown collapses it back to the icon size while the context menu is still open (the pointer moving onto the menu triggers the same "mouse left the widget" detection that normally shrinks it). The menu still works correctly either way — this only affects how it looks for a moment, not functionality.
+
+## Two real bugs found and fixed while testing the widget (unrelated to the widget itself)
+
+Both were pre-existing defects in the backend, invisible before because nothing had ever driven a completely fresh launch through to a populated endpoint list at rest.
+
+| Bug | Symptom | Fix | Verified |
+|---|---|---|---|
+| Startup endpoints never seeded into the reducer | Overlay panel showed "No active playback devices" and the widget showed "No devices" on every fresh launch, indefinitely, despite real active endpoints existing — not a timing issue, the data was simply never sent | `spawn_backend` now seeds `StateManager` directly from `CoreStartup` before the reducer thread starts | Real hardware: first published snapshot went from `endpoints=0 default=<none>` to `endpoints=3` with a real default |
+| `EndpointAdded` carried no friendly name | Once the above was fixed, every endpoint displayed a raw GUID-shaped id instead of a real name (e.g. not "Hoparlör (Realtek(R) Audio)") | The passive `OnDeviceAdded` callback now only posts a raw id through the existing internal (non-`AudioEvent`) channel; the audio core thread itself resolves the real name via `IMMDeviceEnumerator::GetDevice` before emitting the enriched `AudioEvent::EndpointAdded { id, friendly_name }` — the callback itself still never makes a COM call | Real hardware: all three endpoints now show their real names end to end, confirmed both in a fresh `--run` and in the widget's hover list |
+
 ## Known limitations carried into the release
 
 See `README.md`'s "Known limitations" section: `IPolicyConfig` dependency

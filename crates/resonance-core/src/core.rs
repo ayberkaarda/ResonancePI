@@ -12,13 +12,16 @@
 //! owned data and a cloned channel sender: it never calls a COM method, never
 //! takes a lock, and returns immediately after enqueueing.
 //!
-//! `IAudioSessionNotification::OnSessionCreated` is the one callback that is
-//! handed a live COM object rather than plain data. Because the callback is not
-//! allowed to call into COM, it only takes a reference on the object
-//! (`Ref::cloned`, an AddRef) and forwards it over an internal channel to the
-//! core thread, which does all the real work. That channel is deliberately
-//! private to this module: it carries a Windows type and must not appear in
-//! `messages`, which stays platform-independent.
+//! Two callbacks cannot finish their work on their own, because finishing it
+//! would mean calling into COM: `IAudioSessionNotification::OnSessionCreated`,
+//! which is handed a live COM object rather than plain data, and
+//! `IMMNotificationClient::OnDeviceAdded`, which is handed only a device id but
+//! must produce an event carrying the device's display name. Both take the
+//! cheapest possible step — an AddRef in the first case, a string copy in the
+//! second — and forward the result over an internal channel to the core thread,
+//! which does every COM call. That channel is deliberately private to this
+//! module: it carries a Windows type and must not appear in `messages`, which
+//! stays platform-independent.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -182,11 +185,10 @@ fn core_thread_main(
         return;
     }
 
-    // Internal, Windows-typed handoff channel: `OnSessionCreated` is the only
-    // callback that receives a live COM object, and it may not touch it. It
-    // AddRefs the object and posts it here; everything below runs on this
-    // thread.
-    let (raw_tx, raw_rx) = unbounded::<RawSessionEvent>();
+    // Internal, Windows-typed handoff channel: the callbacks that cannot
+    // complete without calling into COM post what little they are given here,
+    // and the loop below finishes the job on this thread.
+    let (raw_tx, raw_rx) = unbounded::<RawCoreEvent>();
 
     let mut core = match AudioCore::new(ev_tx, raw_tx) {
         Ok(core) => core,
@@ -225,13 +227,16 @@ fn core_thread_main(
                 }
             },
             recv(raw_rx) -> message => match message {
-                Ok(RawSessionEvent::Created { endpoint, control }) => {
+                Ok(RawCoreEvent::SessionCreated { endpoint, control }) => {
                     core.on_session_created(&endpoint, control.0);
+                }
+                Ok(RawCoreEvent::DeviceAdded { id }) => {
+                    core.on_device_added(id);
                 }
                 Err(_) => {
                     // Unreachable in practice: `core` owns a sender for this
                     // channel, so it cannot disconnect while the loop runs.
-                    warn!("internal session channel closed, stopping audio core");
+                    warn!("internal handoff channel closed, stopping audio core");
                     break;
                 }
             },
@@ -296,8 +301,9 @@ struct AudioCore {
     endpoints: HashMap<EndpointId, EndpointHook>,
     /// Outbound, platform-independent event channel.
     ev_tx: Sender<AudioEvent>,
-    /// Internal handoff channel handed to every `SessionNotifier`.
-    raw_tx: Sender<RawSessionEvent>,
+    /// Internal handoff channel handed to every notification sink that cannot
+    /// finish its own work without a COM call.
+    raw_tx: Sender<RawCoreEvent>,
     /// Default endpoint switching, when it is both compiled in and available on
     /// this machine.
     ///
@@ -309,7 +315,7 @@ struct AudioCore {
 }
 
 impl AudioCore {
-    fn new(ev_tx: Sender<AudioEvent>, raw_tx: Sender<RawSessionEvent>) -> Result<Self, CoreError> {
+    fn new(ev_tx: Sender<AudioEvent>, raw_tx: Sender<RawCoreEvent>) -> Result<Self, CoreError> {
         // SAFETY: runs on the audio core thread, after CoInitializeEx has put
         // it into the MTA. `MMDeviceEnumerator` is a static CLSID constant, so
         // the pointer passed in is valid for the duration of the call; no
@@ -322,7 +328,11 @@ impl AudioCore {
             CoreError::ComInitFailed(format!("CoCreateInstance(MMDeviceEnumerator) failed: {e}"))
         })?;
 
-        let notify: IMMNotificationClient = DeviceNotifySink { tx: ev_tx.clone() }.into();
+        let notify: IMMNotificationClient = DeviceNotifySink {
+            tx: ev_tx.clone(),
+            raw_tx: raw_tx.clone(),
+        }
+        .into();
 
         // SAFETY: runs on the audio core thread. `notify` is kept alive in the
         // returned struct for at least as long as the registration (it is
@@ -496,6 +506,43 @@ impl AudioCore {
                 warn!(%endpoint, error = ?err, "could not hook a session");
             }
         }
+    }
+
+    /// Finish the work `OnDeviceAdded` could not do itself.
+    ///
+    /// That callback is handed a device id and nothing else, and is not allowed
+    /// to call into COM to learn more. Turning the id back into a device and
+    /// reading its display name therefore happens here, on the core thread, so
+    /// the event that leaves carries a name a user recognises instead of the
+    /// GUID-shaped id.
+    fn on_device_added(&self, id: EndpointId) {
+        // A device can be gone again by the time this lookup runs, and a
+        // property store read can fail transiently. Neither is worth dropping
+        // the event over — an endpoint listed under its id is still an endpoint
+        // the user can select — and the failure is logged where it happens.
+        let friendly_name = self
+            .resolve_friendly_name(&id)
+            .unwrap_or_else(|| id.clone());
+        debug!(%id, %friendly_name, "endpoint added");
+        self.emit(AudioEvent::EndpointAdded { id, friendly_name });
+    }
+
+    /// Look one endpoint up by id and read its display name.
+    ///
+    /// `None` means the device could not be reached or has no readable name;
+    /// both causes are logged here, so callers only have to decide what to
+    /// substitute.
+    fn resolve_friendly_name(&self, id: &EndpointId) -> Option<Arc<str>> {
+        let wide = wide_nul(id);
+        // SAFETY: runs on the audio core thread that owns `self.enumerator`.
+        // `wide` is a NUL-terminated wide copy of `id` that outlives the call,
+        // and the device returned is owned by this scope and released in it.
+        let device = unsafe { self.enumerator.GetDevice(PCWSTR(wide.as_ptr())) }
+            .inspect_err(|e| warn!(%id, error = %e, "IMMDeviceEnumerator::GetDevice failed"))
+            .ok()?;
+        friendly_name(&device)
+            .inspect_err(|err| warn!(%id, error = ?err, "could not read the endpoint display name"))
+            .ok()
     }
 
     /// Re-enumerate one endpoint: hook sessions that appeared while we were not
@@ -728,16 +775,22 @@ impl Drop for EndpointHook {
     }
 }
 
-/// Internal, Windows-typed handoff message.
+/// Internal handoff message: what a notification callback managed to capture
+/// before handing the rest of the work to the core thread.
 ///
-/// Deliberately private to this module: it carries a COM interface pointer and
-/// therefore must never appear in `messages`, which stays free of `windows`
-/// types so `resonance-state` can be built and tested on any OS.
-enum RawSessionEvent {
-    Created {
+/// Deliberately private to this module: one of its variants carries a COM
+/// interface pointer, so it must never appear in `messages`, which stays free
+/// of `windows` types so `resonance-state` can be built and tested on any OS.
+enum RawCoreEvent {
+    /// A new session, still needing a QueryInterface, a process lookup and a
+    /// registration — all COM work, none of it legal inside the callback.
+    SessionCreated {
         endpoint: EndpointId,
         control: MtaSessionControl,
     },
+    /// A new device, still needing its display name looked up — again a COM
+    /// call, and again not one the callback may make.
+    DeviceAdded { id: EndpointId },
 }
 
 /// An owned `IAudioSessionControl` reference in transit between two threads of
@@ -770,7 +823,7 @@ unsafe impl Send for MtaSessionControl {}
 #[implement(IAudioSessionNotification)]
 struct SessionNotifier {
     endpoint: EndpointId,
-    tx: Sender<RawSessionEvent>,
+    tx: Sender<RawCoreEvent>,
 }
 
 /// Invoked on audio-service worker threads, so it must be `Send + Sync`.
@@ -789,7 +842,7 @@ impl IAudioSessionNotification_Impl for SessionNotifier_Impl {
             return Ok(());
         };
         trace!(endpoint = %self.endpoint, "OnSessionCreated");
-        let _ = self.tx.send(RawSessionEvent::Created {
+        let _ = self.tx.send(RawCoreEvent::SessionCreated {
             endpoint: self.endpoint.clone(),
             control: MtaSessionControl(control),
         });
@@ -1182,12 +1235,18 @@ fn take_pwstr(raw: PWSTR) -> Option<String> {
 
 /// Device notification sink.
 ///
-/// Holds nothing but a channel sender: no COM pointer, no lock. Its methods are
-/// invoked on audio-service worker threads, so they only translate the callback
-/// into an owned `AudioEvent`, enqueue it and return.
+/// Holds nothing but two channel senders: no COM pointer, no lock. Its methods
+/// are invoked on audio-service worker threads, so they only copy the callback
+/// parameters into owned values, enqueue them and return.
+///
+/// Most callbacks carry everything their event needs and go straight out on
+/// `tx`. `OnDeviceAdded` is the exception: its event has to carry the device's
+/// display name, which can only be read with a COM call the callback is not
+/// allowed to make, so it goes to the core thread over `raw_tx` instead.
 #[implement(IMMNotificationClient)]
 struct DeviceNotifySink {
     tx: Sender<AudioEvent>,
+    raw_tx: Sender<RawCoreEvent>,
 }
 
 /// The sink is handed to the audio service, which calls it from arbitrary MTA
@@ -1231,7 +1290,9 @@ impl IMMNotificationClient_Impl for DeviceNotifySink_Impl {
             return Ok(());
         };
         trace!(device = %id, "OnDeviceAdded");
-        self.emit(AudioEvent::EndpointAdded(id));
+        // No `emit` here: the event this becomes needs the device's display
+        // name, and reading that is a COM call. The core thread finishes it.
+        let _ = self.raw_tx.send(RawCoreEvent::DeviceAdded { id });
         Ok(())
     }
 
@@ -1272,6 +1333,12 @@ impl IMMNotificationClient_Impl for DeviceNotifySink_Impl {
         // consumed yet; there is no message type for them.
         Ok(())
     }
+}
+
+/// Copy a string into a NUL-terminated UTF-16 buffer, the shape every Win32
+/// `PCWSTR` parameter expects. The buffer must outlive the call it is passed to.
+fn wide_nul(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// Copy a callback string parameter into an owned id.
@@ -1452,20 +1519,24 @@ mod tests {
 
     const TEST_ID: &str = "{0.0.0.00000000}.{11111111-2222-3333-4444-555555555555}";
 
-    fn wide(text: &str) -> Vec<u16> {
-        text.encode_utf16().chain(std::iter::once(0)).collect()
-    }
-
     /// Drives the sink through the real COM vtable, the same way the audio
     /// service does, and checks that each callback turns into the expected
-    /// owned event. This exercises the translation layer only; that Windows
+    /// owned value. This exercises the translation layer only; that Windows
     /// actually delivers these callbacks is verified by running the binary
     /// against real hardware.
+    ///
+    /// `OnDeviceAdded` is checked on the internal channel rather than the event
+    /// channel on purpose. The callback may not call into COM, so all it can do
+    /// is capture the id; the `EndpointAdded` event is not formed until the core
+    /// thread has looked the device's display name up. That second half needs a
+    /// live device and an initialised apartment, so it is exercised by running
+    /// against real hardware rather than here.
     #[test]
     fn notification_callbacks_enqueue_owned_events() {
         let (tx, rx) = unbounded();
-        let client: IMMNotificationClient = DeviceNotifySink { tx }.into();
-        let id = wide(TEST_ID);
+        let (raw_tx, raw_rx) = unbounded();
+        let client: IMMNotificationClient = DeviceNotifySink { tx, raw_tx }.into();
+        let id = wide_nul(TEST_ID);
 
         // SAFETY: `client` is our own object, not a foreign one, and `id` is a
         // NUL-terminated wide string that outlives every call below — exactly
@@ -1484,10 +1555,15 @@ mod tests {
             client.OnDeviceRemoved(PCWSTR(id.as_ptr())).unwrap();
         }
 
-        match rx.try_recv().expect("EndpointAdded") {
-            AudioEvent::EndpointAdded(id) => assert_eq!(&*id, TEST_ID),
-            _ => panic!("expected EndpointAdded"),
+        match raw_rx.try_recv().expect("DeviceAdded") {
+            RawCoreEvent::DeviceAdded { id } => assert_eq!(&*id, TEST_ID),
+            _ => panic!("expected DeviceAdded"),
         }
+        assert!(
+            raw_rx.try_recv().is_err(),
+            "only OnDeviceAdded uses the internal channel here"
+        );
+
         match rx.try_recv().expect("EndpointStateChanged") {
             AudioEvent::EndpointStateChanged { id, state } => {
                 assert_eq!(&*id, TEST_ID);
@@ -1524,8 +1600,9 @@ mod tests {
     #[test]
     fn property_changes_are_not_forwarded_yet() {
         let (tx, rx) = unbounded();
-        let client: IMMNotificationClient = DeviceNotifySink { tx }.into();
-        let id = wide(TEST_ID);
+        let (raw_tx, raw_rx) = unbounded();
+        let client: IMMNotificationClient = DeviceNotifySink { tx, raw_tx }.into();
+        let id = wide_nul(TEST_ID);
 
         // SAFETY: as above — our own object, and `id` outlives the call.
         unsafe {
@@ -1535,6 +1612,10 @@ mod tests {
         }
 
         assert!(rx.try_recv().is_err(), "property changes emit no event yet");
+        assert!(
+            raw_rx.try_recv().is_err(),
+            "property changes need no core-thread follow-up either"
+        );
     }
 
     const TEST_INSTANCE: &str = "{0.0.0.00000000}.{1111}|\\Device\\HarddiskVolume4\\a.exe%b{2222}";
@@ -1594,7 +1675,7 @@ mod tests {
     #[test]
     fn session_state_and_disconnect_callbacks_map_to_events() {
         let (sink, rx) = test_sink();
-        let text = wide("whatever");
+        let text = wide_nul("whatever");
 
         // SAFETY: our own object; `text` is a NUL-terminated wide string that
         // outlives every call, and the channel slice is a live stack array.
@@ -1634,7 +1715,7 @@ mod tests {
 
     #[test]
     fn session_notification_callback_ignores_a_null_session() {
-        let (tx, rx) = unbounded::<RawSessionEvent>();
+        let (tx, rx) = unbounded::<RawCoreEvent>();
         let endpoint: EndpointId = Arc::from(TEST_ID);
         let notifier: IAudioSessionNotification = SessionNotifier { endpoint, tx }.into();
 

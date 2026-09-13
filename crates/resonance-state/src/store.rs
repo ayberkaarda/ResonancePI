@@ -91,6 +91,15 @@ pub struct Settings {
     pub prune_after_days: u32,
     #[serde(default, with = "hotkey_config")]
     pub hotkey: HotkeyConfig,
+    /// Whether the corner widget is on screen (default `true`).
+    #[serde(default = "default_widget_visible")]
+    pub widget_visible: bool,
+    /// Where the user dragged the corner widget, or `None` to let it dock to
+    /// its default corner. Same shape and same absent-key handling as
+    /// `overlay_position`: `Option` already deserializes a missing key as
+    /// `None`, which is the product default here.
+    #[serde(default)]
+    pub widget_position: Option<(f32, f32)>,
 }
 
 /// Matches `Settings::default()`. `RoleSet` derives `Default`, but that
@@ -113,6 +122,13 @@ fn default_prune_after_days() -> u32 {
     90
 }
 
+/// Matches `Settings::default()`; `bool::default()` is `false`, which would
+/// turn the widget off for every document written before this key existed —
+/// the opposite of the product default, and invisible rather than noisy.
+fn default_widget_visible() -> bool {
+    true
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -122,6 +138,8 @@ impl Default for Settings {
             autostart: false,
             prune_after_days: 90,
             hotkey: HotkeyConfig::default(),
+            widget_visible: true,
+            widget_position: None,
         }
     }
 }
@@ -408,6 +426,8 @@ mod tests {
         assert_eq!(settings.overlay_position, None);
         assert!(!settings.autostart);
         assert_eq!(settings.hotkey, HotkeyConfig::default());
+        assert!(settings.widget_visible);
+        assert_eq!(settings.widget_position, None);
         assert_eq!(settings, Settings::default());
     }
 
@@ -449,6 +469,34 @@ mod tests {
         assert_eq!(without_prune.prune_after_days, 90);
         assert_eq!(without_prune.overlay_opacity, 0.25);
         assert_eq!(without_prune.switch_roles, RoleSet::all());
+
+        // A document written before the widget existed carries no
+        // `widget_visible` key at all; it has to come back on, not off.
+        let without_widget: Settings = serde_json::from_str(
+            r#"{
+                "overlay_opacity": 0.5,
+                "autostart": true,
+                "prune_after_days": 30
+            }"#,
+        )
+        .expect("deserialize");
+        assert!(without_widget.widget_visible);
+        assert!(without_widget.autostart);
+        assert_eq!(without_widget.prune_after_days, 30);
+
+        // Present and false is a user who hid it, and must survive the round
+        // trip unchanged rather than being overwritten by the default.
+        let widget_hidden: Settings =
+            serde_json::from_str(r#"{ "widget_visible": false }"#).expect("deserialize");
+        assert!(!widget_hidden.widget_visible);
+        assert_eq!(widget_hidden.overlay_opacity, 0.9);
+
+        // A dragged widget position survives, and its absence stays `None`
+        // rather than collapsing to an origin the widget would jump to.
+        let moved: Settings =
+            serde_json::from_str(r#"{ "widget_position": [120.0, 480.0] }"#).expect("deserialize");
+        assert_eq!(moved.widget_position, Some((120.0, 480.0)));
+        assert!(moved.widget_visible);
     }
 
     /// `#[serde(default = "...")]` composes with `#[serde(with = "...")]`: the

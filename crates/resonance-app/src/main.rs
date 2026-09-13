@@ -291,6 +291,8 @@ fn overlay_mode() -> ExitCode {
         handles.snapshot_rx.clone(),
         handles.initial_hotkey,
         handles.initial_autostart,
+        handles.initial_widget_visible,
+        handles.initial_widget_position,
     );
     handles.shutdown();
 
@@ -597,7 +599,9 @@ fn describe_event(event: &AudioEvent) -> String {
         AudioEvent::EndpointStateChanged { id, state } => {
             format!("EndpointStateChanged   state={state:?} id={id}")
         }
-        AudioEvent::EndpointAdded(id) => format!("EndpointAdded          id={id}"),
+        AudioEvent::EndpointAdded { id, friendly_name } => {
+            format!("EndpointAdded          id={id} name={friendly_name}")
+        }
         AudioEvent::EndpointRemoved(id) => format!("EndpointRemoved        id={id}"),
         AudioEvent::SessionCreated { endpoint, session } => format!(
             "SessionCreated         endpoint={endpoint} process={} instance={}",

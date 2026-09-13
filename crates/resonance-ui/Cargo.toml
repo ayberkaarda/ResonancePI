@@ -27,12 +27,23 @@ egui = { version = "0.36.2", default-features = false }
 
 tray-icon = "0.25.0"
 
-# Used only to register a system-wide keyboard shortcut and to pump its
-# message loop on a dedicated thread. No audio or COM interface is touched
-# here; those live entirely in the audio core crate.
+# Used to register a system-wide keyboard shortcut, and to create and draw the
+# corner widget's layered window, each on its own dedicated message-pump
+# thread. No audio or COM interface is touched here; those live entirely in the
+# audio core crate.
+#
+# `Win32_Graphics_Gdi` is what the widget's bitmap and its text need (a device
+# context holding a DIB section, blended into the window by
+# UpdateLayeredWindow); `Win32_System_LibraryLoader` supplies the module handle
+# its window class is registered against; `Win32_UI_Controls` is where
+# WM_MOUSELEAVE is declared, which is how the widget learns the pointer has
+# left it and that it should collapse again.
 windows = { version = "=0.62.2", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
     "Win32_System_Threading",
+    "Win32_UI_Controls",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }

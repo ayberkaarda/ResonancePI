@@ -62,6 +62,10 @@ flowchart LR
         Hotkey["RegisterHotKey / WM_HOTKEY"]
     end
 
+    subgraph WidgetTh["Corner widget thread (independent Win32 message loop)"]
+        Widget["Layered window, static icon"]
+    end
+
     AudioSrv -- COM callbacks on arbitrary MTA threads --> DevNotif
     AudioSrv -- COM callbacks --> SessNotif
     AudioSrv -- COM callbacks --> SessEv
@@ -81,6 +85,7 @@ flowchart LR
     Overlay --> Bridge
     Tray -- ToggleOverlay / Quit --> Bridge
     Hotkey -- ToggleOverlay --> Bridge
+    Widget -- ToggleOverlay --> Bridge
 ```
 
 ## Threads and ownership
@@ -94,6 +99,7 @@ flowchart LR
 | **UI (main)** | STA (winit, only while `eframe::run_native` is actually running) | egui context, the overlay window itself | `Snapshot` | `UiCommand` |
 | **Tray** | STA (its own Win32 message loop) | tray icon, its menu | menu clicks | `UiCommand::ToggleOverlay` / `Quit` (via a signal channel into the UI thread) |
 | **Hotkey** | STA (its own Win32 message loop, `RegisterHotKey`/`WM_HOTKEY`) | the registered global shortcut | `WM_HOTKEY` | `UiCommand::ToggleOverlay` (same signal channel) |
+| **Corner widget** | STA (its own Win32 message loop) | one layered window, `WS_EX_LAYERED \| WS_EX_TOPMOST \| WS_EX_TOOLWINDOW`, showing a static icon | left/right click | `UiCommand::ToggleOverlay` on left-click; `ShowWidget`/`HideWidget` (same signal channel) on the tray's "Show icon" item / the widget's own right-click "Hide" |
 
 The audio core is its own dedicated thread, explicitly initialized as MTA,
 because `RegisterSessionNotification` silently drops session notifications
@@ -129,6 +135,23 @@ overlay never opened: ~14 MB. Opening it costs real, unavoidable OpenGL
 driver residency (measured ~76 MB open / ~49 MB closed-after-having-been-
 opened-once on this machine's AMD driver) that the ADR-0004 budget
 revision accounts for.
+
+## Corner widget
+
+A small, fixed-position, fixed-size icon docked in a corner of the screen,
+visible by default, that stays on screen for as long as the application
+runs (unless hidden). Left-clicking it opens the full overlay panel, the
+same action the tray icon and the global shortcut already trigger.
+Right-clicking it shows a one-item menu, "Hide"; the tray icon's own menu
+gains a matching "Show icon" item to bring it back. See ADR-0005 for why
+this is deliberately **not** rendered through `eframe`/`egui` like the
+full panel: a persistent second `eframe` viewport would keep an OpenGL
+context resident for most of the application's running time, undoing the
+whole point of the overlay's lazy lifecycle above. It is instead a plain
+Win32 layered window (`UpdateLayeredWindow`, premultiplied BGRA) on its
+own dedicated thread with its own message pump — structurally identical
+to how the tray icon and the global hotkey are already built, and costing
+nothing while idle for the same reason they do.
 
 ## Crate layout
 
@@ -170,12 +193,18 @@ audio or COM interface from `resonance-core` is ever touched there.
 Single source of truth: `crates/resonance-core/src/messages.rs`.
 
 - `AudioEvent` — emitted by the audio core (endpoint/session changes) and
-  consumed by the reducer.
+  consumed by the reducer. `EndpointAdded` carries both the id and a real
+  friendly name: the id alone is what a passive `IMMNotificationClient`
+  callback can safely provide (see "COM callback implementations" below),
+  so the friendly name is resolved on the audio core thread itself (an
+  `IMMDeviceEnumerator::GetDevice` lookup, safe there) before the event is
+  forwarded — a callback never performs that lookup itself.
 - `CoreCommand` — issued by the reducer, executed by the audio core (apply
   a session's volume, switch the default endpoint, resync, or shut down).
-- `UiCommand` — issued by the UI/tray/hotkey, consumed by the reducer
-  (switch endpoint, set a session's volume/mute, forget a saved entry, set
-  the hotkey, set autostart, toggle the overlay, quit).
+- `UiCommand` — issued by the UI/tray/hotkey/widget, consumed by the
+  reducer (switch endpoint, set a session's volume/mute, forget a saved
+  entry, set the hotkey, set autostart, set the corner widget's
+  visibility, toggle the overlay, quit).
 - `Snapshot` — an owned, cheaply-cloneable read model published by the
   reducer after each step; the only thing the UI thread ever sees of the
   rest of the system.
@@ -200,6 +229,22 @@ inside a `Dispatch` wrapper the reducer produces internally; a
 switch before it was sent) is dropped rather than applied, so two quick
 switches in succession cannot apply the wrong profile to the wrong
 endpoint.
+
+## Startup seeding
+
+The audio core's one-shot bootstrap (`CoreStartup`) already knows the full
+active-endpoint list and the current default the moment it finishes —
+before the reducer thread even starts. `spawn_backend` feeds that
+directly into the freshly-created `StateManager` (synchronous
+`handle_audio_event` calls, not routed through the `AudioEvent` channel)
+before the reducer thread takes ownership of it, so the very first
+published `Snapshot` already reflects reality. Without this, the live
+view stayed empty until some later hot-plug or default-switch event
+happened to occur, since live `AudioEvent`s only ever report *changes*
+after startup, never what was already there — a real, measured defect
+(both the overlay panel and the corner widget showed no devices at all on
+a plain fresh launch, indefinitely, on hardware with three real active
+endpoints) rather than a hypothetical one.
 
 ## Persistence
 

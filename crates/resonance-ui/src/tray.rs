@@ -24,6 +24,7 @@ use crate::icon::tray_icon_rgba;
 use crate::{wake, UiSignal, Waker};
 
 const TOGGLE_ITEM_ID: &str = "resonance.toggle-overlay";
+const SHOW_WIDGET_ITEM_ID: &str = "resonance.show-widget";
 const QUIT_ITEM_ID: &str = "resonance.quit";
 
 /// A running tray icon. Dropping it stops the thread, which removes the icon
@@ -89,10 +90,16 @@ fn build_icon() -> Result<tray_icon::TrayIcon, String> {
     let icon = Icon::from_rgba(rgba, width, height).map_err(|e| e.to_string())?;
 
     let toggle = MenuItem::with_id(TOGGLE_ITEM_ID, "Toggle overlay", true, None);
+    // The corner widget hides itself from its own menu, so this is the only
+    // way back. It is offered unconditionally rather than only while the
+    // widget is hidden: the menu is built once, here, and showing something
+    // already on screen does nothing.
+    let show_widget = MenuItem::with_id(SHOW_WIDGET_ITEM_ID, "Show icon", true, None);
     let quit = MenuItem::with_id(QUIT_ITEM_ID, "Quit", true, None);
     let separator = PredefinedMenuItem::separator();
 
-    let menu = Menu::with_items(&[&toggle, &separator, &quit]).map_err(|e| e.to_string())?;
+    let menu =
+        Menu::with_items(&[&toggle, &show_widget, &separator, &quit]).map_err(|e| e.to_string())?;
 
     TrayIconBuilder::new()
         .with_menu(Box::new(menu))
@@ -137,6 +144,7 @@ fn install_handlers(signal_tx: Sender<UiSignal>, waker: Waker) {
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         let signal = match event.id.0.as_str() {
             TOGGLE_ITEM_ID => UiSignal::ToggleOverlay,
+            SHOW_WIDGET_ITEM_ID => UiSignal::ShowWidget,
             QUIT_ITEM_ID => UiSignal::Quit,
             other => {
                 tracing::trace!(id = other, "ignoring unknown tray menu item");

@@ -225,8 +225,8 @@ impl StateManager {
                 self.on_endpoint_state_changed(id, state);
                 Vec::new()
             }
-            AudioEvent::EndpointAdded(id) => {
-                self.on_endpoint_added(id);
+            AudioEvent::EndpointAdded { id, friendly_name } => {
+                self.on_endpoint_added(id, friendly_name);
                 Vec::new()
             }
             AudioEvent::EndpointRemoved(id) => {
@@ -396,8 +396,10 @@ impl StateManager {
         }
     }
 
-    fn on_endpoint_added(&mut self, id: EndpointId) {
-        let friendly_name = self.known_friendly_name(&id);
+    /// The name is taken from the event rather than looked up: the core reads
+    /// it from the device itself, which is the only source that knows it for an
+    /// endpoint this store has never seen before.
+    fn on_endpoint_added(&mut self, id: EndpointId, friendly_name: Arc<str>) {
         self.live_endpoints.insert(
             id.clone(),
             EndpointView {
@@ -490,6 +492,21 @@ impl StateManager {
             // actual registry write happens in the platform layer.
             UiCommand::SetAutostart(enabled) => {
                 self.store.settings.autostart = enabled;
+                self.mark_dirty();
+                Vec::new()
+            }
+            // Whether the corner widget is on screen is likewise a persisted
+            // preference; the native window it refers to is owned by the UI
+            // layer, which shows or hides it before sending this.
+            UiCommand::SetWidgetVisible(enabled) => {
+                self.store.settings.widget_visible = enabled;
+                self.mark_dirty();
+                Vec::new()
+            }
+            // Sent once when a drag ends, not while it is in progress, so this
+            // records a resting place rather than every intermediate position.
+            UiCommand::SetWidgetPosition(x, y) => {
+                self.store.settings.widget_position = Some((x, y));
                 self.mark_dirty();
                 Vec::new()
             }
@@ -739,6 +756,13 @@ mod tests {
 
     fn manager() -> StateManager {
         StateManager::from_store(ProfileStore::default())
+    }
+
+    fn endpoint_added(endpoint: &str, friendly_name: &str) -> AudioEvent {
+        AudioEvent::EndpointAdded {
+            id: id(endpoint),
+            friendly_name: Arc::from(friendly_name),
+        }
     }
 
     fn default_changed(endpoint: Option<&str>) -> AudioEvent {
@@ -1281,10 +1305,41 @@ mod tests {
     }
 
     #[test]
+    fn ui_set_widget_visible_updates_settings_and_dirties_the_store() {
+        let mut m = manager();
+
+        // The stored default is `true`, so hiding it is the change that
+        // proves the command is actually applied rather than read back.
+        let out = m.handle_ui_command(UiCommand::SetWidgetVisible(false));
+
+        assert!(out.is_empty());
+        assert!(!m.settings().widget_visible);
+        assert!(m.is_dirty());
+    }
+
+    #[test]
+    fn ui_set_widget_position_updates_settings_and_dirties_the_store() {
+        let mut m = manager();
+
+        let out = m.handle_ui_command(UiCommand::SetWidgetPosition(240.0, 96.0));
+
+        assert!(out.is_empty());
+        assert_eq!(m.settings().widget_position, Some((240.0, 96.0)));
+        assert!(m.is_dirty());
+    }
+
+    #[test]
     fn endpoint_lifecycle_updates_the_live_view() {
         let mut m = manager();
-        m.handle_audio_event(AudioEvent::EndpointAdded(id(HEADPHONES)));
+        m.handle_audio_event(endpoint_added(HEADPHONES, "Headphones (USB Audio)"));
         m.handle_audio_event(session_created(HEADPHONES, "spotify.exe", "s1", 0.30));
+
+        // The name the core read from the device is what the live view shows;
+        // nothing was ever stored for this endpoint to fall back on.
+        assert_eq!(
+            &*m.snapshot().endpoints[0].friendly_name,
+            "Headphones (USB Audio)"
+        );
 
         m.handle_audio_event(AudioEvent::EndpointStateChanged {
             id: id(HEADPHONES),
@@ -1367,7 +1422,7 @@ mod tests {
             );
         }
         let mut m = StateManager::from_store(store);
-        m.handle_audio_event(AudioEvent::EndpointAdded(id(HEADPHONES)));
+        m.handle_audio_event(endpoint_added(HEADPHONES, HEADPHONES));
         m.handle_audio_event(default_changed(Some(SPEAKERS)));
 
         let removed = m.prune(now);
@@ -1417,12 +1472,14 @@ mod tests {
     #[test]
     fn switching_records_the_endpoint_as_seen() {
         let mut m = manager();
-        m.handle_audio_event(AudioEvent::EndpointAdded(id(SPEAKERS)));
+        m.handle_audio_event(endpoint_added(SPEAKERS, "Speakers (Realtek Audio)"));
 
         m.handle_audio_event(default_changed(Some(SPEAKERS)));
 
+        // The profile records the live display name, so an endpoint that is
+        // absent on a later launch is still listed under a readable name.
         let profile = m.store().endpoints.get(&id(SPEAKERS)).expect("touched");
-        assert_eq!(profile.friendly_name, SPEAKERS);
+        assert_eq!(profile.friendly_name, "Speakers (Realtek Audio)");
         assert!(m.is_dirty());
     }
 

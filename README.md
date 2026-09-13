@@ -20,11 +20,15 @@ configurable from the overlay's settings panel).
 
 ## Usage
 
-Run `resonance-app.exe --overlay`. It starts in the tray with no visible
-window; press the global shortcut (or click the tray icon) to open the
+Run `resonance-app.exe --overlay`. By default a small icon docks in the
+bottom-right corner of the screen; hover over it to see the connected
+devices and click one to switch to it directly, or click the icon itself
+(or press the global shortcut, or use the tray icon) to open the full
 overlay, pick a device tab, and adjust or forget per-application entries.
-Toggling "Start with Windows" in the settings panel launches it
-automatically at sign-in.
+Press and hold the icon to drag it anywhere on screen; it stays there
+across restarts. Right-click it to hide it; bring it back from the tray
+icon's "Show icon" menu item. Toggling "Start with Windows" in the
+settings panel launches it automatically at sign-in.
 
 Two additional command-line modes exist for diagnosing the backend without
 any UI — `resonance-app --run` and `resonance-app --dump-events` — see
@@ -60,6 +64,19 @@ of the normal user workflow.
   than growing at higher scale factors. It renders correctly at every
   scale tested; it's simply a fixed-size panel by design, not a scaling
   defect.
+- **The corner widget starts in the bottom-right corner** unless you've
+  already dragged it somewhere else, in which case it remembers that
+  position across restarts.
+- **While the overlay panel is open, "Show icon" (tray menu) and the
+  widget's own "Hide" have no effect.** Both work normally again as soon
+  as the panel is closed.
+- **Right-clicking the widget while its device list is showing collapses
+  it back to the small icon** while the "Hide" menu is open — the menu
+  still works correctly, it's only a visual quirk.
+- **The widget's device rows all use the same icon** — there's no
+  reliable way to tell a headphone from a speaker from a generic Windows
+  audio endpoint, so each row shows the device's real name instead of
+  guessing an icon for it.
 
 ## License
 

@@ -131,7 +131,14 @@ pub enum AudioEvent {
         id: EndpointId,
         state: EndpointState,
     },
-    EndpointAdded(EndpointId),
+    /// A render endpoint appeared. `friendly_name` is the display name read
+    /// from the device itself, so a consumer never has to invent one: an
+    /// endpoint seen for the first time still gets a readable label rather
+    /// than its id.
+    EndpointAdded {
+        id: EndpointId,
+        friendly_name: Arc<str>,
+    },
     EndpointRemoved(EndpointId),
     SessionCreated {
         endpoint: EndpointId,
@@ -186,6 +193,8 @@ pub enum UiCommand {
     },
     SetHotkey(HotkeyConfig),
     SetAutostart(bool),
+    SetWidgetVisible(bool),
+    SetWidgetPosition(f32, f32),
     ToggleOverlay,
     Quit,
 }

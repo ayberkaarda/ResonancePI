@@ -26,6 +26,7 @@ mod icon;
 mod overlay;
 mod theme;
 mod tray;
+mod widget;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -42,6 +43,10 @@ use overlay::{overlay_viewport, OverlayState};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UiSignal {
     ToggleOverlay,
+    /// Put the corner widget back on screen, raised from the tray menu.
+    ShowWidget,
+    /// Take the corner widget off screen, raised from its own menu.
+    HideWidget,
     Quit,
 }
 
@@ -97,11 +102,23 @@ impl ExitFlags {
 /// `initial_autostart` is the "start with Windows" setting read from the
 /// saved settings at startup. The user can toggle it from the settings panel;
 /// that change is sent back over `ui_cmd_tx` for the backend to store.
+///
+/// `initial_widget_visible` is whether the corner widget is on screen, read
+/// from the saved settings at startup. The user can hide it from the widget's
+/// own menu and bring it back from the tray menu; either change is applied
+/// here and sent back over `ui_cmd_tx` for the backend to store.
+///
+/// `initial_widget_position` is where the corner widget was last dragged to,
+/// or `None` to let it dock to its default corner. The widget sends its own
+/// `UiCommand::SetWidgetPosition` when a drag ends, so this is only ever read
+/// at startup.
 pub fn run(
     ui_cmd_tx: Sender<UiCommand>,
     snapshot_rx: Receiver<Snapshot>,
     initial_hotkey: HotkeyConfig,
     initial_autostart: bool,
+    initial_widget_visible: bool,
+    initial_widget_position: Option<(f32, f32)>,
 ) -> eframe::Result {
     let (signal_tx, signal_rx) = crossbeam_channel::unbounded::<UiSignal>();
     let (bridge_shutdown_tx, bridge_shutdown_rx) = crossbeam_channel::bounded::<()>(0);
@@ -123,6 +140,30 @@ pub fn run(
         Ok(tray) => Some(tray),
         Err(err) => {
             tracing::error!(error = %err, "could not create the tray icon");
+            None
+        }
+    };
+
+    // Held for its side effect too: the widget leaves the screen when it is
+    // dropped, at the end of this function. It is created even when the saved
+    // setting says hidden, so the tray menu can bring it back without having
+    // to build a window first.
+    //
+    // It reads the same shared snapshot the overlay panel does — that is where
+    // the endpoints it lists come from — and sends the two commands it owns
+    // (switching an endpoint, recording where it was dragged to) straight to
+    // the backend, since neither needs anything from this thread.
+    let widget = match widget::spawn(
+        signal_tx.clone(),
+        ui_cmd_tx.clone(),
+        waker.clone(),
+        Arc::clone(&latest_snapshot),
+        initial_widget_visible,
+        initial_widget_position,
+    ) {
+        Ok(widget) => Some(widget),
+        Err(err) => {
+            tracing::error!(error = %err, "could not create the corner widget");
             None
         }
     };
@@ -157,6 +198,7 @@ pub fn run(
         &latest_snapshot,
         &waker,
         &exit_flags,
+        widget.as_ref(),
     );
 
     // Stops the bridge thread before the channels it holds go away.
@@ -173,11 +215,18 @@ fn main_loop(
     latest_snapshot: &Arc<Mutex<Option<Snapshot>>>,
     waker: &Waker,
     exit_flags: &ExitFlags,
+    widget: Option<&widget::Widget>,
 ) -> eframe::Result {
     loop {
         match signal_rx.recv() {
             // Every sender is gone, so nothing can ask for the overlay again.
             Err(_) => return Ok(()),
+            // The window is shown or hidden here and the setting is recorded
+            // afterwards, in that order: the visible state is what the user
+            // asked for, and storing it is bookkeeping that must not decide
+            // whether the widget moves.
+            Ok(UiSignal::ShowWidget) => set_widget_visible(ui_cmd_tx, widget, true),
+            Ok(UiSignal::HideWidget) => set_widget_visible(ui_cmd_tx, widget, false),
             Ok(UiSignal::Quit) => {
                 if ui_cmd_tx.send(UiCommand::Quit).is_err() {
                     tracing::warn!("the backend had already stopped when quit was requested");
@@ -199,6 +248,21 @@ fn main_loop(
                 }
             }
         }
+    }
+}
+
+/// Moves the corner widget on or off screen and records the new setting.
+fn set_widget_visible(ui_cmd_tx: &Sender<UiCommand>, widget: Option<&widget::Widget>, show: bool) {
+    if let Some(widget) = widget {
+        if show {
+            widget.show();
+        } else {
+            widget.hide();
+        }
+    }
+
+    if ui_cmd_tx.send(UiCommand::SetWidgetVisible(show)).is_err() {
+        tracing::warn!("the backend had already stopped when the widget was toggled");
     }
 }
 
