@@ -15,7 +15,10 @@
 //!   the global keyboard shortcut, and the overlay window itself. This is
 //!   the real application; the other two modes exist for debugging.
 
+mod autostart;
 mod backend;
+mod panic_hook;
+mod single_instance;
 
 use std::io::{self, BufRead};
 use std::process::ExitCode;
@@ -28,6 +31,7 @@ use resonance_core::messages::{
     AudioEvent, CoreCommand, CoreError, EndpointView, ProcessKey, RoleSet, SessionInstanceId,
     Snapshot,
 };
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 const USAGE: &str = "\
@@ -62,6 +66,26 @@ enum Mode {
     Overlay,
 }
 
+impl Mode {
+    /// Whether this mode starts the full backend, and therefore the
+    /// persistence thread that owns the profile store on disk.
+    ///
+    /// This is what decides whether the single-instance guard applies. The
+    /// point of the guard is to stop two copies of the application from
+    /// fighting over two process-wide resources — the global keyboard
+    /// shortcut and the profile store — and it is the backend that claims
+    /// both. `--dump-events` claims neither: it starts the audio core alone,
+    /// only listens, and writes nothing, so it is deliberately left
+    /// unguarded and can be run alongside a live instance to observe it,
+    /// which is the entire reason that mode exists.
+    fn starts_backend(self) -> bool {
+        match self {
+            Mode::Run | Mode::Overlay => true,
+            Mode::DumpEvents | Mode::None => false,
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let mut mode = Mode::None;
 
@@ -83,6 +107,29 @@ fn main() -> ExitCode {
     }
 
     init_logging();
+
+    // Installed before anything that can panic is started, so a panic during
+    // backend startup is still logged. It can only flush once the backend
+    // exists to be flushed; see the module docs.
+    panic_hook::install();
+
+    // Held for the rest of `main` so the mutex name stays claimed for as long
+    // as this process runs. `--help` and the argument-error paths have already
+    // returned above without reaching this point: asking for usage text while
+    // the application is running is not a second instance of anything, and
+    // refusing to print it would be a pointless obstruction.
+    let _instance_guard = if mode.starts_backend() {
+        match single_instance::acquire() {
+            single_instance::Instance::Only(guard) => Some(guard),
+            single_instance::Instance::AlreadyRunning => {
+                println!("Resonance is already running; this instance will exit.");
+                info!("another instance holds the single-instance mutex, exiting quietly");
+                return ExitCode::SUCCESS;
+            }
+        }
+    } else {
+        None
+    };
 
     match mode {
         Mode::DumpEvents => dump_events_mode(),
@@ -179,6 +226,8 @@ fn run_mode() -> ExitCode {
         }
     };
 
+    panic_hook::set_emergency_flush(handles.emergency_flush());
+
     print_startup(&handles.startup);
 
     println!();
@@ -220,10 +269,28 @@ fn overlay_mode() -> ExitCode {
         }
     };
 
+    panic_hook::set_emergency_flush(handles.emergency_flush());
+
+    // Reconcile the registry with the stored setting once per launch. Windows
+    // gives the user ways to remove the entry that this application never sees
+    // (Task Manager's Startup tab, or another tool editing the key), which
+    // would otherwise leave the overlay's toggle showing "on" forever while
+    // nothing actually started with Windows. Re-asserting it here is also what
+    // makes a failed `SetAutostart` write self-heal on the next launch. It is
+    // only ever a convenience, so a failure is logged and nothing more.
+    if let Err(err) = autostart::apply(handles.initial_autostart) {
+        warn!(
+            error = %err,
+            enabled = handles.initial_autostart,
+            "could not reconcile the autostart entry at startup"
+        );
+    }
+
     let result = resonance_ui::run(
         handles.ui_cmd_tx.clone(),
         handles.snapshot_rx.clone(),
         handles.initial_hotkey,
+        handles.initial_autostart,
     );
     handles.shutdown();
 

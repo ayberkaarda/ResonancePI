@@ -93,10 +93,15 @@ impl ExitFlags {
 /// reads from the saved settings. The user can record a different one from the
 /// settings panel; that change is registered here and sent back over
 /// `ui_cmd_tx` for the backend to store.
+///
+/// `initial_autostart` is the "start with Windows" setting read from the
+/// saved settings at startup. The user can toggle it from the settings panel;
+/// that change is sent back over `ui_cmd_tx` for the backend to store.
 pub fn run(
     ui_cmd_tx: Sender<UiCommand>,
     snapshot_rx: Receiver<Snapshot>,
     initial_hotkey: HotkeyConfig,
+    initial_autostart: bool,
 ) -> eframe::Result {
     let (signal_tx, signal_rx) = crossbeam_channel::unbounded::<UiSignal>();
     let (bridge_shutdown_tx, bridge_shutdown_rx) = crossbeam_channel::bounded::<()>(0);
@@ -142,6 +147,7 @@ pub fn run(
     let state = Arc::new(Mutex::new(OverlayState::new(
         ui_cmd_tx.clone(),
         Arc::clone(&hotkey),
+        initial_autostart,
     )));
 
     let result = main_loop(

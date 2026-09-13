@@ -2245,6 +2245,7 @@ dependencies = [
  "resonance-ui",
  "tracing",
  "tracing-subscriber",
+ "windows",
 ]
 
 [[package]]

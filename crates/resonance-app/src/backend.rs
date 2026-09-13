@@ -92,14 +92,71 @@ pub struct BackendHandles {
     /// UI is the only thing that ever changes it, so it applies a change to
     /// itself immediately and reports it here only for persistence.
     pub initial_hotkey: HotkeyConfig,
+    /// The "start with Windows" setting as loaded from the profile store.
+    ///
+    /// Read here for the same reason as `initial_hotkey`: a UI needs it to
+    /// draw the toggle before any `Snapshot` has arrived. It is also what the
+    /// binary reconciles the registry against at startup, since the registry
+    /// entry can be removed behind the application's back (Task Manager's
+    /// Startup tab does exactly that) while this stored value still says the
+    /// user wanted it on.
+    pub initial_autostart: bool,
 
     core: CoreThread,
     reducer: JoinHandle<()>,
     persistence: JoinHandle<()>,
     shutdown_tx: Sender<()>,
+    flush_ack_rx: Receiver<()>,
+}
+
+/// A cloneable, ownership-free way to ask the running backend to flush its
+/// pending profile write and stop.
+///
+/// [`BackendHandles::shutdown`] consumes the handles by value, which makes it
+/// unusable from anywhere that does not own them — a panic hook, for one,
+/// runs on whichever thread panicked and has no access to them at all (they
+/// may by then have been moved into the UI's event loop). This type carries
+/// only channel ends, so it can be cloned into a process-wide slot and used
+/// from any thread.
+///
+/// It deliberately cannot join any thread: joining from a panicking thread
+/// risks waiting on a thread that is itself waiting, so a caller gets a
+/// bounded acknowledgement instead of a completion guarantee.
+#[derive(Clone)]
+pub struct EmergencyFlush {
+    shutdown_tx: Sender<()>,
+    ack_rx: Receiver<()>,
+}
+
+impl EmergencyFlush {
+    /// Asks the reducer to flush, then waits up to `timeout` for it to report
+    /// that the flush attempt finished. Returns whether that report arrived.
+    ///
+    /// The send itself never blocks (the channel is unbounded), so the only
+    /// waiting happens on the acknowledgement. `false` means the flush was not
+    /// confirmed within `timeout`: either the reducer thread is gone, or it is
+    /// the very thread that called this and so can never answer itself, or it
+    /// is simply slower than the deadline. In none of those cases is blocking
+    /// longer useful — a caller that is about to abort the process needs to
+    /// keep going regardless.
+    pub fn request(&self, timeout: Duration) -> bool {
+        if self.shutdown_tx.send(()).is_err() {
+            return false;
+        }
+        self.ack_rx.recv_timeout(timeout).is_ok()
+    }
 }
 
 impl BackendHandles {
+    /// A handle that can trigger the same flush-and-stop as [`Self::shutdown`]
+    /// from a thread that does not own the backend.
+    pub fn emergency_flush(&self) -> EmergencyFlush {
+        EmergencyFlush {
+            shutdown_tx: self.shutdown_tx.clone(),
+            ack_rx: self.flush_ack_rx.clone(),
+        }
+    }
+
     /// Orderly shutdown: flush any pending profile write synchronously, stop
     /// the audio core, and join every thread this module started.
     ///
@@ -147,6 +204,7 @@ pub fn spawn_backend() -> Result<BackendHandles, BackendError> {
     // is the one piece of persisted settings a caller needs before the
     // reducer thread exists to publish anything.
     let initial_hotkey = state_manager.settings().hotkey;
+    let initial_autostart = state_manager.settings().autostart;
     let save_repo = JsonFileRepository::new(store_path);
 
     let (cmd_tx, cmd_rx) = unbounded::<CoreCommand>();
@@ -156,6 +214,7 @@ pub fn spawn_backend() -> Result<BackendHandles, BackendError> {
     let (persist_tx, persist_rx) = unbounded::<PersistRequest>();
     let (persist_result_tx, persist_result_rx) = unbounded::<PersistResult>();
     let (shutdown_tx, shutdown_rx) = unbounded::<()>();
+    let (flush_ack_tx, flush_ack_rx) = unbounded::<()>();
 
     let core = core::spawn(cmd_rx, ev_tx).map_err(BackendError::Core)?;
     let startup = core.startup().clone();
@@ -177,6 +236,7 @@ pub fn spawn_backend() -> Result<BackendHandles, BackendError> {
                 cmd_tx,
                 persist_tx,
                 snapshot_tx,
+                flush_ack_tx,
             })
         })
         .expect("failed to spawn reducer thread");
@@ -186,10 +246,12 @@ pub fn spawn_backend() -> Result<BackendHandles, BackendError> {
         ui_cmd_tx,
         snapshot_rx,
         initial_hotkey,
+        initial_autostart,
         core,
         reducer,
         persistence,
         shutdown_tx,
+        flush_ack_rx,
     })
 }
 
@@ -234,6 +296,11 @@ struct ReducerChannels {
     cmd_tx: Sender<CoreCommand>,
     persist_tx: Sender<PersistRequest>,
     snapshot_tx: Sender<Snapshot>,
+    /// Signalled once, after the shutdown flush has been attempted, so a
+    /// caller that only holds channel ends can tell the flush finished. Sent
+    /// on unconditionally: "the flush attempt is over" is the useful fact,
+    /// whether or not anything was actually dirty.
+    flush_ack_tx: Sender<()>,
 }
 
 /// Reducer thread body: owns the `StateManager`, and is the sole authority on
@@ -262,6 +329,7 @@ fn reducer_thread_main(mut ch: ReducerChannels) {
             },
             recv(ch.ui_cmd_rx) -> message => match message {
                 Ok(command) => {
+                    apply_ui_side_effects(&command);
                     let dispatches = ch.state.handle_ui_command(command);
                     apply_dispatches(&ch.state, dispatches, &ch.cmd_tx);
                     publish_snapshot(&ch.state, &ch.snapshot_tx);
@@ -286,6 +354,7 @@ fn reducer_thread_main(mut ch: ReducerChannels) {
             recv(ch.shutdown_rx) -> _ => {
                 info!("reducer received shutdown, flushing pending profile writes");
                 flush_synchronously(&mut ch.state, &ch.persist_tx, &ch.persist_result_rx);
+                let _ = ch.flush_ack_tx.send(());
                 break;
             },
         }
@@ -294,6 +363,33 @@ fn reducer_thread_main(mut ch: ReducerChannels) {
     let _ = ch.cmd_tx.send(CoreCommand::Shutdown);
     // `ch.persist_tx` is dropped here, at the end of this function, which is
     // what lets the persistence thread's `persist_rx.iter()` end.
+}
+
+/// Performs the side effects a `UiCommand` needs that live outside the state
+/// machine, before the command is folded into state.
+///
+/// Only autostart qualifies today. `StateManager` is deliberately
+/// platform-independent, so it records that the user wants autostart on or off
+/// but cannot itself touch the registry; that half belongs to the binary.
+///
+/// This runs *before* `handle_ui_command`, and the command is forwarded there
+/// afterwards whether or not this succeeded. Both halves of that are chosen:
+///
+/// - Attempting the fallible, external half first keeps the warning below
+///   adjacent to the command that caused it, and ahead of the `Snapshot` that
+///   will publish the new value as though it had taken effect.
+/// - Forwarding regardless means a registry failure never silently discards
+///   the user's preference. The stored setting stays the record of what was
+///   asked for, and the next launch reconciles the registry against it (see
+///   `BackendHandles::initial_autostart`), so a transient failure — a locked
+///   key, a policy hiccup — repairs itself rather than quietly reverting a
+///   toggle the user watched move.
+fn apply_ui_side_effects(command: &UiCommand) {
+    if let UiCommand::SetAutostart(enabled) = command {
+        if let Err(err) = crate::autostart::apply(*enabled) {
+            warn!(error = %err, enabled, "could not apply the autostart setting");
+        }
+    }
 }
 
 /// Sends every non-stale dispatch to the audio core, in order, and drops the

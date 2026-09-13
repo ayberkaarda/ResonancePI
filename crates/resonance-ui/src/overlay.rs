@@ -57,11 +57,11 @@ const MIN_LIST_HEIGHT: f32 = 80.0;
 ///
 /// The mixer list is capped to whatever is left, so that opening the settings
 /// shortens the list instead of pushing it off the bottom of the window. The
-/// settings block has fixed contents — three rows, a hint, and room for the
+/// settings block has fixed contents — four rows, a hint, and room for the
 /// one line of feedback the shortcut recorder can show — so a constant is
 /// enough; it is set a little generously, and erring high only leaves a small
 /// gap.
-const SETTINGS_BLOCK_HEIGHT: f32 = 168.0;
+const SETTINGS_BLOCK_HEIGHT: f32 = 196.0;
 
 /// Shown while the settings panel is waiting for a combination to be pressed.
 const RECORDING_PROMPT: &str = "Press a combination…";
@@ -100,6 +100,10 @@ pub(crate) struct OverlayState {
     selected_endpoint: Option<EndpointId>,
     opacity: f32,
     opaque_mode: bool,
+    /// Whether Resonance should launch automatically with Windows. Toggling
+    /// this in the settings panel sends the change to the backend, which is
+    /// responsible for storing it and for the actual registry write.
+    autostart: bool,
     settings_open: bool,
     /// Set while the settings panel is listening for the combination to store.
     recording_hotkey: bool,
@@ -117,7 +121,7 @@ pub(crate) struct OverlayState {
 }
 
 impl OverlayState {
-    pub(crate) fn new(tx: Sender<UiCommand>, hotkey: Arc<HotkeyControl>) -> Self {
+    pub(crate) fn new(tx: Sender<UiCommand>, hotkey: Arc<HotkeyControl>, autostart: bool) -> Self {
         Self {
             tx,
             hotkey,
@@ -125,6 +129,7 @@ impl OverlayState {
             selected_endpoint: None,
             opacity: DEFAULT_OPACITY,
             opaque_mode: false,
+            autostart,
             settings_open: false,
             recording_hotkey: false,
             hotkey_notice: None,
@@ -940,6 +945,21 @@ fn draw_settings(ui: &mut Ui, state: &mut OverlayState) {
         });
     });
 
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Start with Windows").color(theme::TEXT_PRIMARY));
+
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let mut autostart = state.autostart;
+            if switch(ui, &mut autostart, theme::ACCENT)
+                .on_hover_text("Launch Resonance automatically when you sign in.")
+                .changed()
+            {
+                state.autostart = autostart;
+                state.send(UiCommand::SetAutostart(autostart));
+            }
+        });
+    });
+
     draw_hotkey_row(ui, state);
 
     ui.add_space(2.0);
@@ -1083,7 +1103,7 @@ mod tests {
     fn state_with_channel() -> (OverlayState, crossbeam_channel::Receiver<UiCommand>) {
         let (tx, rx) = unbounded();
         let hotkey = HotkeyControl::new(HotkeyConfig::default(), || {});
-        (OverlayState::new(tx, hotkey), rx)
+        (OverlayState::new(tx, hotkey, false), rx)
     }
 
     fn endpoint(id: &str, name: &str) -> resonance_core::messages::EndpointView {
@@ -1299,6 +1319,18 @@ mod tests {
 
         s.hotkey_notice = Some(KEY_NOT_SUPPORTED);
         assert_eq!(s.hotkey_notice(), Some(KEY_NOT_SUPPORTED));
+    }
+
+    #[test]
+    fn autostart_round_trips_from_the_constructor() {
+        let (tx, _rx) = unbounded();
+        let hotkey = HotkeyControl::new(HotkeyConfig::default(), || {});
+
+        let s = OverlayState::new(tx.clone(), Arc::clone(&hotkey), true);
+        assert!(s.autostart);
+
+        let s = OverlayState::new(tx, hotkey, false);
+        assert!(!s.autostart);
     }
 
     #[test]

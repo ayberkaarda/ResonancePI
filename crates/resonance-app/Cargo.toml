@@ -3,6 +3,7 @@ name = "resonance-app"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "resonance-app"
@@ -15,3 +16,16 @@ resonance-ui = { path = "../resonance-ui" }
 crossbeam-channel = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Used for the single-instance mutex and the autostart registry entry. No
+# audio or COM interface is touched here; those live entirely in the audio
+# core crate.
+windows = { version = "=0.62.2", features = [
+    "Win32_Foundation",
+    # `CreateMutexW` takes a `*const SECURITY_ATTRIBUTES` and is compiled out
+    # entirely without this feature, even though a null attribute pointer is
+    # passed: the declaration itself is gated on it.
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_System_Registry",
+] }

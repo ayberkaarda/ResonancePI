@@ -486,6 +486,13 @@ impl StateManager {
                 self.mark_dirty();
                 Vec::new()
             }
+            // Likewise an autostart toggle is a persisted preference; the
+            // actual registry write happens in the platform layer.
+            UiCommand::SetAutostart(enabled) => {
+                self.store.settings.autostart = enabled;
+                self.mark_dirty();
+                Vec::new()
+            }
             // Overlay lifetime and process exit belong to the UI/app layer.
             UiCommand::ToggleOverlay | UiCommand::Quit => Vec::new(),
         }
@@ -640,6 +647,15 @@ impl StateManager {
     // --------------------------------------------------------------- helpers
 
     /// Writes one profile entry and arms the debounce.
+    ///
+    /// A process key of the form `pid:<n>` is a last-resort placeholder for a
+    /// process whose real image name could not be recovered; a bare pid is
+    /// not a stable identity across restarts, so persisting it would leave
+    /// the profile store with an entry that means nothing after reboot and
+    /// could even be matched against the wrong process once the pid is
+    /// reused. Such an entry is skipped here — the caller has already
+    /// updated the live view, so the session is still tracked correctly for
+    /// the current run, it just never reaches disk.
     fn record_entry(
         &mut self,
         endpoint: &EndpointId,
@@ -647,6 +663,9 @@ impl StateManager {
         volume: f32,
         muted: bool,
     ) {
+        if process.starts_with("pid:") {
+            return;
+        }
         let now = SystemTime::now();
         let entry = SessionEntry {
             volume: clamp_volume(volume),
@@ -868,6 +887,27 @@ mod tests {
         assert_eq!(entry.volume, 0.42);
         assert!(!entry.muted);
         assert!(m.is_dirty());
+    }
+
+    #[test]
+    fn pid_placeholder_process_key_is_never_persisted() {
+        let mut m = manager();
+
+        let out = m.handle_audio_event(session_created(HEADPHONES, "pid:4242", "s1", 0.42));
+
+        assert!(applies(&out).is_empty(), "nothing to restore yet");
+        assert!(
+            stored(&m, HEADPHONES, "pid:4242").is_none(),
+            "a bare pid is not a stable identity and must not reach the profile store"
+        );
+        let live = m
+            .live_session(&SessionInstanceId::from("s1"))
+            .expect("the live view is unaffected by the persistence guard");
+        assert_eq!(live.volume, 0.42);
+        assert!(
+            !m.is_dirty(),
+            "skipping the pid-keyed write must not arm the debounce"
+        );
     }
 
     #[test]
@@ -1226,6 +1266,17 @@ mod tests {
 
         assert!(out.is_empty());
         assert_eq!(m.settings().hotkey, new_hotkey);
+        assert!(m.is_dirty());
+    }
+
+    #[test]
+    fn ui_set_autostart_updates_settings_and_dirties_the_store() {
+        let mut m = manager();
+
+        let out = m.handle_ui_command(UiCommand::SetAutostart(true));
+
+        assert!(out.is_empty());
+        assert!(m.settings().autostart);
         assert!(m.is_dirty());
     }
 

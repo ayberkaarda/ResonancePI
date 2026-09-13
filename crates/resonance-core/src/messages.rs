@@ -185,6 +185,7 @@ pub enum UiCommand {
         process: ProcessKey,
     },
     SetHotkey(HotkeyConfig),
+    SetAutostart(bool),
     ToggleOverlay,
     Quit,
 }
