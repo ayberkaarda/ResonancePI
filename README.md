@@ -1,5 +1,7 @@
 # Resonance
 
+[English](README.md) | [Türkçe](README.tr.md)
+
 A lightweight Windows background tool that remembers each application's
 volume and mute state per audio output device, and restores it
 automatically whenever the default device changes.
@@ -21,15 +23,26 @@ configurable from the overlay's settings panel).
 ## Usage
 
 Run `resonance-app.exe --overlay`. By default a small icon docks in the
-bottom-right corner of the screen; hover over it to see the connected
-devices and click one to switch to it directly, or click the icon itself
-(or press the global shortcut, or use the tray icon) to open the full
-overlay, pick a device tab, and adjust or forget per-application entries —
-the corner icon steps aside while the full overlay is open and comes back
-once it's closed. Press and hold the icon to drag it anywhere on screen;
-it stays there across restarts. Right-click it to hide it; bring it back
-from the tray icon's "Show icon" menu item. Toggling "Start with Windows"
-in the settings panel launches it automatically at sign-in.
+bottom-right corner of the screen:
+
+<img src="docs/screenshots/widget-rest.png" alt="The corner widget at rest, a small circular icon" width="72">
+
+Hover over it (no click needed) to see the connected devices and click one
+to switch to it directly:
+
+<img src="docs/screenshots/widget-hover.png" alt="Hovering over the widget expands it into a list of connected audio devices" width="320">
+
+Click the icon itself (or press the global shortcut, or use the tray icon)
+to open the full overlay, pick a device tab, and adjust or forget
+per-application entries — the corner icon steps aside while the full
+overlay is open and comes back once it's closed:
+
+<img src="docs/screenshots/panel.png" alt="The full overlay panel, showing device tabs and a per-application volume slider" width="320">
+
+Press and hold the icon to drag it anywhere on screen; it stays there
+across restarts. Right-click it to hide it; bring it back from the tray
+icon's "Show icon" menu item. Toggling "Start with Windows" in the
+settings panel launches it automatically at sign-in.
 
 Two additional command-line modes exist for diagnosing the backend without
 any UI — `resonance-app --run` and `resonance-app --dump-events` — see
@@ -68,9 +81,10 @@ of the normal user workflow.
 - **The corner widget starts in the bottom-right corner** unless you've
   already dragged it somewhere else, in which case it remembers that
   position across restarts.
-- **While the overlay panel is open, "Show icon" (tray menu) and the
-  widget's own "Hide" have no effect.** Both work normally again as soon
-  as the panel is closed.
+- **While the overlay panel is open, "Show icon" (tray menu) has no
+  effect.** The widget hides automatically for as long as the panel is
+  open and comes back once it's closed, so there's nothing to show or
+  hide in the meantime.
 - **The widget's device rows all use the same icon** — there's no
   reliable way to tell a headphone from a speaker from a generic Windows
   audio endpoint, so each row shows the device's real name instead of
