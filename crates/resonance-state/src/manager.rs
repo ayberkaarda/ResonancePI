@@ -479,6 +479,13 @@ impl StateManager {
                 }
                 Vec::new()
             }
+            // A hotkey change is a persisted preference, not something the
+            // audio core needs to know about.
+            UiCommand::SetHotkey(config) => {
+                self.store.settings.hotkey = config;
+                self.mark_dirty();
+                Vec::new()
+            }
             // Overlay lifetime and process exit belong to the UI/app layer.
             UiCommand::ToggleOverlay | UiCommand::Quit => Vec::new(),
         }
@@ -1202,6 +1209,24 @@ mod tests {
         assert!(m.handle_ui_command(UiCommand::Quit).is_empty());
         assert_eq!(m.revision(), revision);
         assert!(!m.is_dirty());
+    }
+
+    #[test]
+    fn ui_set_hotkey_updates_settings_and_dirties_the_store() {
+        let mut m = manager();
+        let new_hotkey = resonance_core::messages::HotkeyConfig {
+            ctrl: false,
+            alt: true,
+            shift: true,
+            win: false,
+            key: 0x20,
+        };
+
+        let out = m.handle_ui_command(UiCommand::SetHotkey(new_hotkey));
+
+        assert!(out.is_empty());
+        assert_eq!(m.settings().hotkey, new_hotkey);
+        assert!(m.is_dirty());
     }
 
     #[test]

@@ -5,4 +5,33 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-resonance-core = { path = "../resonance-core" }
+resonance-core = { path = "../resonance-core", default-features = false }
+crossbeam-channel = "0.5"
+tracing = "0.1"
+
+# The OpenGL (glow) renderer is selected deliberately and the wgpu renderer is
+# never compiled: wgpu costs roughly 10 MB of extra resident memory and its
+# swapchain handling makes per-pixel window transparency less reliable, which
+# this borderless overlay depends on.
+#
+# `default_fonts` is deliberately left out: it pulls in Hack, Ubuntu-Light and
+# two emoji fonts (several hundred KB together) purely so glyphs the overlay
+# never needs are available. The overlay embeds its own single Latin font
+# instead (see `app.rs`), and every place that used to rely on a font glyph
+# for an icon now draws it with the painter instead.
+eframe = { version = "0.36.2", default-features = false, features = [
+    "glow",
+] }
+egui = { version = "0.36.2", default-features = false }
+
+tray-icon = "0.25.0"
+
+# Used only to register a system-wide keyboard shortcut and to pump its
+# message loop on a dedicated thread. No audio or COM interface is touched
+# here; those live entirely in the audio core crate.
+windows = { version = "=0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }

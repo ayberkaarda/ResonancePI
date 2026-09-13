@@ -17,6 +17,35 @@ pub enum Role {
     Communications,
 }
 
+/// A global keyboard shortcut, stored as the modifier keys held plus one
+/// non-modifier key. The `key` field is a raw virtual-key code: this type
+/// stays a platform-neutral bag of fields so it can be persisted from
+/// `resonance-state` without that crate taking a dependency on `windows`;
+/// translating `key` to and from a native key constant is the job of
+/// whichever platform layer registers the shortcut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HotkeyConfig {
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+    pub win: bool,
+    pub key: u32,
+}
+
+impl Default for HotkeyConfig {
+    /// Ctrl+Alt+V — the shortcut this product has shipped with until now.
+    /// `0x56` is the Windows virtual-key code for `V`.
+    fn default() -> Self {
+        Self {
+            ctrl: true,
+            alt: true,
+            shift: false,
+            win: false,
+            key: 0x56,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RoleSet {
     pub console: bool,
@@ -155,6 +184,7 @@ pub enum UiCommand {
         endpoint: EndpointId,
         process: ProcessKey,
     },
+    SetHotkey(HotkeyConfig),
     ToggleOverlay,
     Quit,
 }

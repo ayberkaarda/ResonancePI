@@ -17,8 +17,12 @@
 //!   does not derive `Serialize`/`Deserialize` there (this crate must not
 //!   modify `resonance-core`), so [`role_set`] encodes it as its three
 //!   public `bool` fields.
+//! - `HotkeyConfig` (`Settings::hotkey`): also defined in `resonance-core`
+//!   without deriving `Serialize`/`Deserialize`, so [`hotkey_config`] encodes
+//!   it as its five public fields, the same way [`role_set`] does for
+//!   `RoleSet`.
 
-use resonance_core::messages::{EndpointId, ProcessKey, RoleSet};
+use resonance_core::messages::{EndpointId, HotkeyConfig, ProcessKey, RoleSet};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -69,6 +73,8 @@ pub struct Settings {
     pub autostart: bool,
     /// Drop entries not seen for N days (default 90).
     pub prune_after_days: u32,
+    #[serde(with = "hotkey_config")]
+    pub hotkey: HotkeyConfig,
 }
 
 impl Default for Settings {
@@ -79,6 +85,7 @@ impl Default for Settings {
             overlay_opacity: 0.9,
             autostart: false,
             prune_after_days: 90,
+            hotkey: HotkeyConfig::default(),
         }
     }
 }
@@ -160,6 +167,53 @@ mod role_set {
     }
 }
 
+/// `HotkeyConfig` <-> its five public fields for serde.
+///
+/// `resonance_core::messages::HotkeyConfig` does not derive `Serialize`/
+/// `Deserialize` (and this crate must not add that to `resonance-core`), so
+/// this shim reads/writes its fields directly instead.
+mod hotkey_config {
+    use resonance_core::messages::HotkeyConfig;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize, Deserialize)]
+    struct HotkeyConfigShadow {
+        ctrl: bool,
+        alt: bool,
+        shift: bool,
+        win: bool,
+        key: u32,
+    }
+
+    pub fn serialize<S>(hotkey: &HotkeyConfig, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        HotkeyConfigShadow {
+            ctrl: hotkey.ctrl,
+            alt: hotkey.alt,
+            shift: hotkey.shift,
+            win: hotkey.win,
+            key: hotkey.key,
+        }
+        .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<HotkeyConfig, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let shadow = HotkeyConfigShadow::deserialize(deserializer)?;
+        Ok(HotkeyConfig {
+            ctrl: shadow.ctrl,
+            alt: shadow.alt,
+            shift: shadow.shift,
+            win: shadow.win,
+            key: shadow.key,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,6 +234,10 @@ mod tests {
         assert_eq!(settings.overlay_opacity, 0.9);
         assert!(!settings.autostart);
         assert_eq!(settings.prune_after_days, 90);
+        assert_eq!(
+            settings.hotkey,
+            resonance_core::messages::HotkeyConfig::default()
+        );
     }
 
     #[test]
@@ -202,6 +260,23 @@ mod tests {
                 console: true,
                 multimedia: false,
                 communications: true,
+            },
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&settings).expect("serialize");
+        let decoded: Settings = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(settings, decoded);
+    }
+
+    #[test]
+    fn settings_hotkey_round_trips_through_json() {
+        let settings = Settings {
+            hotkey: resonance_core::messages::HotkeyConfig {
+                ctrl: false,
+                alt: true,
+                shift: true,
+                win: true,
+                key: 0x20,
             },
             ..Settings::default()
         };

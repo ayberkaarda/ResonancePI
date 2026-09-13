@@ -1,18 +1,32 @@
 //! Resonance binary.
 //!
-//! At this stage the only thing it can do is `--dump-events`: start the audio
-//! core, print the active render endpoints, and then print every device and
-//! session event the core reports until the process is interrupted with Ctrl+C.
+//! Three modes exist today:
+//!
+//! - `--dump-events`: start the audio core only, print the active render
+//!   endpoints, and then print every device and session event the core
+//!   reports until the process is interrupted (Ctrl+C, or the `quit`
+//!   console command).
+//! - `--run`: start the full backend (audio core + state manager +
+//!   persistence, see [`backend`]) and keep it running until `quit`, printing
+//!   audio events and snapshot revisions to stdout instead of showing any UI.
+//!   Useful for verifying the backend on its own.
+//! - `--overlay`: start the full backend and hand its command sender and
+//!   snapshot receiver to `resonance_ui::run`, which owns the tray icon,
+//!   the global keyboard shortcut, and the overlay window itself. This is
+//!   the real application; the other two modes exist for debugging.
+
+mod backend;
 
 use std::io::{self, BufRead};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crossbeam_channel::{unbounded, Sender};
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use resonance_core::core::{self, CoreStartup};
 use resonance_core::messages::{
     AudioEvent, CoreCommand, CoreError, EndpointView, ProcessKey, RoleSet, SessionInstanceId,
+    Snapshot,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -21,22 +35,41 @@ resonance-app
 
 USAGE:
     resonance-app --dump-events
+    resonance-app --run
+    resonance-app --overlay
 
 OPTIONS:
-    --dump-events    Print the active render endpoints, then stream audio device
-                     and session events to stdout until interrupted (Ctrl+C).
+    --dump-events    Start the audio core only, then stream audio device and
+                     session events to stdout until interrupted (Ctrl+C) or
+                     the `quit` console command.
+    --run            Start the full backend (audio core, state manager,
+                     persistence) and keep it running, printing audio events
+                     and snapshot revisions, until `quit`. No overlay/tray UI:
+                     this is for backend verification only.
+    --overlay        Start the full backend and the overlay/tray UI. This is
+                     the real application.
     -h, --help       Show this message.
 
 ENVIRONMENT:
     RESONANCE_LOG    Log filter (default: info). Example: RESONANCE_LOG=trace
 ";
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    None,
+    DumpEvents,
+    Run,
+    Overlay,
+}
+
 fn main() -> ExitCode {
-    let mut dump_events = false;
+    let mut mode = Mode::None;
 
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
-            "--dump-events" => dump_events = true,
+            "--dump-events" => mode = Mode::DumpEvents,
+            "--run" => mode = Mode::Run,
+            "--overlay" => mode = Mode::Overlay,
             "-h" | "--help" => {
                 print!("{USAGE}");
                 return ExitCode::SUCCESS;
@@ -51,13 +84,16 @@ fn main() -> ExitCode {
 
     init_logging();
 
-    if !dump_events {
-        eprintln!("error: no mode selected\n");
-        eprint!("{USAGE}");
-        return ExitCode::FAILURE;
+    match mode {
+        Mode::DumpEvents => dump_events_mode(),
+        Mode::Run => run_mode(),
+        Mode::Overlay => overlay_mode(),
+        Mode::None => {
+            eprintln!("error: no mode selected\n");
+            eprint!("{USAGE}");
+            ExitCode::FAILURE
+        }
     }
-
-    dump_events_mode()
 }
 
 fn init_logging() {
@@ -125,6 +161,121 @@ fn dump_events_mode() -> ExitCode {
     // Reached only if the core thread dropped its event sender.
     core.join();
     ExitCode::SUCCESS
+}
+
+/// `--run`: start the full backend and keep it alive until `quit`.
+///
+/// This does not yet drive an overlay/tray UI — `resonance-ui` is separate,
+/// unfinished work. What this mode proves is that the backend itself works
+/// end to end: the audio core reports events, the reducer restores/records
+/// profile entries and republishes a `Snapshot` after every step, and the
+/// persistence thread writes `%APPDATA%\Resonance\profiles.json`.
+fn run_mode() -> ExitCode {
+    let handles = match backend::spawn_backend() {
+        Ok(handles) => handles,
+        Err(err) => {
+            eprintln!("error: backend failed to start: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    print_startup(&handles.startup);
+
+    println!();
+    println!(
+        "backend running: audio core + state manager + persistence (Ctrl+C or 'quit' to stop)"
+    );
+    println!("no overlay/tray UI yet -- this mode only makes the backend observable");
+    println!("try: plug/unplug a device, change the default output in Windows sound settings,");
+    println!("     or move an application's slider in the Windows volume mixer");
+    println!();
+    println!("commands (type at the prompt below, then Enter):");
+    println!("  quit    flush any pending profile write, stop the backend and exit");
+    println!("  help    show this again");
+    println!();
+
+    let snapshot_printer = spawn_snapshot_printer(handles.snapshot_rx.clone());
+
+    read_run_commands();
+
+    handles.shutdown();
+    // The printer thread's loop ends on its own once the reducer thread (the
+    // only sender for `snapshot_tx`) has returned and dropped its sender.
+    let _ = snapshot_printer.join();
+
+    ExitCode::SUCCESS
+}
+
+/// `--overlay`: start the full backend and hand it to the overlay/tray UI.
+///
+/// `resonance_ui::run` owns the event loop from here on and blocks until the
+/// user quits (from the tray menu or the overlay itself); this function's job
+/// is only to start the backend first and shut it down afterwards.
+fn overlay_mode() -> ExitCode {
+    let handles = match backend::spawn_backend() {
+        Ok(handles) => handles,
+        Err(err) => {
+            eprintln!("error: backend failed to start: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let result = resonance_ui::run(
+        handles.ui_cmd_tx.clone(),
+        handles.snapshot_rx.clone(),
+        handles.initial_hotkey,
+    );
+    handles.shutdown();
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("error: overlay UI failed: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Prints every published `Snapshot`'s revision and headline counts.
+///
+/// This deliberately prints *every* value it receives rather than draining to
+/// the latest one: it exists to observe the backend during manual
+/// verification, not to demonstrate the "take only the latest" consumption
+/// policy a real UI would use (documented on `BackendHandles::snapshot_rx`).
+fn spawn_snapshot_printer(snapshot_rx: Receiver<Snapshot>) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        for snapshot in snapshot_rx.iter() {
+            println!(
+                "snapshot                revision={} endpoints={} live_sessions={} default={}",
+                snapshot.revision,
+                snapshot.endpoints.len(),
+                snapshot.live_sessions.len(),
+                snapshot.default_endpoint.as_deref().unwrap_or("<none>")
+            );
+        }
+    })
+}
+
+/// Blocks reading console commands for `--run` until `quit` (or EOF/Ctrl+C,
+/// which closes stdin and ends the loop the same way `--dump-events` does).
+fn read_run_commands() {
+    let stdin = io::stdin();
+    for line in stdin.lock().lines() {
+        let line = match line {
+            Ok(line) => line,
+            Err(_) => break,
+        };
+        match line.trim() {
+            "quit" => break,
+            "help" => {
+                println!("commands:");
+                println!("  quit    flush any pending profile write, stop the backend and exit");
+                println!("  help    show this message");
+            }
+            "" => continue,
+            _ => println!("unknown command, type 'help' for the command list"),
+        }
+    }
 }
 
 fn update_sessions(sessions: &Arc<Mutex<Vec<SessionSnapshot>>>, event: &AudioEvent) {

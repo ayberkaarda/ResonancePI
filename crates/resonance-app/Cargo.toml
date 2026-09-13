@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 resonance-core = { path = "../resonance-core" }
 resonance-state = { path = "../resonance-state" }
+resonance-ui = { path = "../resonance-ui" }
 crossbeam-channel = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
