@@ -54,12 +54,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, GetCursorPos, GetMessageW, KillTimer, LoadCursorW, PostMessageW,
-    PostQuitMessage, PostThreadMessageW, RegisterClassExW, SetForegroundWindow, SetTimer,
-    ShowWindow, SystemParametersInfoW, TrackPopupMenuEx, TranslateMessage, UnregisterClassW,
-    UpdateLayeredWindow, IDC_ARROW, MF_STRING, MSG, SPI_GETWORKAREA, SW_HIDE, SW_SHOWNA,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA, WM_APP,
-    WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NULL, WM_QUIT, WM_RBUTTONUP,
+    DispatchMessageW, GetCursorPos, GetMessageW, GetWindowRect, KillTimer, LoadCursorW,
+    PostMessageW, PostQuitMessage, PostThreadMessageW, RegisterClassExW, SetForegroundWindow,
+    SetTimer, ShowWindow, SystemParametersInfoW, TrackPopupMenuEx, TranslateMessage,
+    UnregisterClassW, UpdateLayeredWindow, IDC_ARROW, MF_STRING, MSG, SPI_GETWORKAREA, SW_HIDE,
+    SW_SHOWNA, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA,
+    WM_APP, WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NULL, WM_QUIT, WM_RBUTTONUP,
     WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
@@ -209,6 +209,11 @@ struct Runtime {
     /// Whether `TrackMouseEvent` is currently armed, so it is asked for once
     /// per entry rather than once per mouse move.
     tracking: bool,
+    /// Set for the duration of `TrackPopupMenuEx`. The pointer moving onto
+    /// the menu itself fires the same `WM_MOUSELEAVE` a real exit would, and
+    /// without this the list would visibly collapse behind the menu it was
+    /// just right-clicked from.
+    menu_open: bool,
 }
 
 impl Runtime {
@@ -221,6 +226,7 @@ impl Runtime {
             hovered_row: None,
             drag: None,
             tracking: false,
+            menu_open: false,
         }
     }
 
@@ -1133,6 +1139,29 @@ fn cursor_position() -> Option<(i32, i32)> {
     Some((cursor.x, cursor.y))
 }
 
+/// Whether the pointer is currently within `hwnd`'s on-screen bounds.
+///
+/// Used only where a real `WM_MOUSELEAVE`/`WM_MOUSEMOVE` cannot be relied on
+/// to answer this — e.g. right after a modal call like `TrackPopupMenuEx`
+/// returns, which can swallow a leave event that fired while it was pumping.
+/// Missing either coordinate (a transient `GetCursorPos`/`GetWindowRect`
+/// failure) is treated as "not over it": failing to shrink a widget that
+/// should have is a smaller mistake than leaving it stuck open.
+fn cursor_is_over(hwnd: HWND) -> bool {
+    let Some((x, y)) = cursor_position() else {
+        return false;
+    };
+
+    let mut rect = RECT::default();
+    // SAFETY: `hwnd` is this thread's own window, alive for the call, and
+    // `rect` is a live RECT owned by this frame for its whole duration.
+    if unsafe { GetWindowRect(hwnd, &mut rect) }.is_err() {
+        return false;
+    }
+
+    x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
+}
+
 fn start_timer(hwnd: HWND, id: usize, interval: u32) {
     // SAFETY: `hwnd` is this thread's own window. Setting a timer that already
     // exists restarts it, which is exactly what the callers want; a null
@@ -1244,8 +1273,10 @@ fn on_mouse_leave(hwnd: HWND) {
         runtime.tracking = false;
         runtime.hovered_row = None;
         // A drag can take the pointer off the window; that is not a reason to
-        // collapse anything, and the drag's own release will sort it out.
-        runtime.drag.is_none()
+        // collapse anything, and the drag's own release will sort it out. The
+        // context menu does the same thing for the same reason: the pointer
+        // moving onto it is not the user backing away from the list.
+        runtime.drag.is_none() && !runtime.menu_open
     });
 
     stop_timer(hwnd, TIMER_DWELL);
@@ -1509,6 +1540,12 @@ fn show_context_menu(hwnd: HWND) {
     // SAFETY: `hwnd` is this thread's own window and is alive here.
     let _ = unsafe { SetForegroundWindow(hwnd) };
 
+    // Set for exactly the span `TrackPopupMenuEx` pumps messages: the pointer
+    // moving from the badge onto the menu fires a real `WM_MOUSELEAVE`, and
+    // without this the list would collapse behind the menu it was just
+    // opened from.
+    with_runtime(|runtime| runtime.menu_open = true);
+
     // SAFETY: `menu` and `hwnd` are both alive and owned by this thread. The
     // call pumps messages internally until the menu closes — which is why the
     // context was copied out of the thread-local above rather than borrowed,
@@ -1516,6 +1553,17 @@ fn show_context_menu(hwnd: HWND) {
     // report the chosen command instead of posting one.
     let chosen =
         unsafe { TrackPopupMenuEx(menu, (TPM_RETURNCMD | TPM_RIGHTBUTTON).0, x, y, hwnd, None) };
+
+    with_runtime(|runtime| runtime.menu_open = false);
+
+    // The suppressed `WM_MOUSELEAVE` (if the pointer left for the menu) is
+    // gone for good — Windows does not resend it — so whether to shrink now
+    // has to be decided here instead, from where the pointer actually ended
+    // up once the menu closed.
+    if !cursor_is_over(hwnd) {
+        animate_to(hwnd, 0);
+        repaint(hwnd);
+    }
 
     // The documented companion to taking the foreground above: it lets the
     // menu release properly when the user clicks away without choosing.

@@ -70,9 +70,6 @@ of the normal user workflow.
 - **While the overlay panel is open, "Show icon" (tray menu) and the
   widget's own "Hide" have no effect.** Both work normally again as soon
   as the panel is closed.
-- **Right-clicking the widget while its device list is showing collapses
-  it back to the small icon** while the "Hide" menu is open — the menu
-  still works correctly, it's only a visual quirk.
 - **The widget's device rows all use the same icon** — there's no
   reliable way to tell a headphone from a speaker from a generic Windows
   audio endpoint, so each row shows the device's real name instead of
