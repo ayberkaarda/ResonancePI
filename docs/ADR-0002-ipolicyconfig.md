@@ -6,15 +6,15 @@ Proposed (2026-09-12)
 
 ## Context
 
-PROMPT.md §5–§6 requires Resonance to be able to change the system's default
-audio render endpoint (all three roles: console, multimedia, communications)
-from inside the app — this is the "switch" half of the product, the other
-half being per-endpoint profile restore. Windows has never shipped a public,
-documented API for this. Every shipping tool in this product class (EarTrumpet,
+Resonance needs to be able to change the system's default audio render
+endpoint (all three roles: console, multimedia, communications) from inside
+the app — this is the "switch" half of the product, the other half being
+per-endpoint profile restore. Windows has never shipped a public, documented
+API for this. Every shipping tool in this product class (EarTrumpet,
 SoundSwitch, AudioSwitcher and others) drives the same private coclass,
 `PolicyConfigClient`, through its undocumented `IPolicyConfig` interface —
 there is no supported alternative; the only choice is whether Resonance
-implements switching at all (PROMPT.md §6.3).
+implements switching at all.
 
 Because the interface has no published header, its vtable layout cannot be
 taken from an SDK — it has to be reconstructed from independent public
@@ -124,13 +124,12 @@ unconditionally, with no `IPolicyConfig` code compiled in at all.
 ## Alternatives considered
 
 - **Do not implement switching at all, profiles only.** Rejected: switching
-  the OS default endpoint from inside the app is a core part of the product
-  (PROMPT.md §5), not an optional extra: a user plugging in headphones and
-  wanting Resonance to both switch the output and restore its remembered
-  volume is the primary scenario. This ADR's feature-flag/degrade design keeps
-  this alternative available as a fallback build mode rather than the whole
-  product's default.
+  the OS default endpoint from inside the app is a core part of the product,
+  not an optional extra: a user plugging in headphones and wanting Resonance
+  to both switch the output and restore its remembered volume is the primary
+  scenario. This ADR's feature-flag/degrade design keeps this alternative
+  available as a fallback build mode rather than the whole product's default.
 - **Add the `IPolicyConfigVista` fallback now.** Deferred, not rejected: all
   four sources agree its method order matches the modern interface, so the
   work is small if a pre-Windows-10 target is ever needed; adding it now would
-  be speculative given PROMPT.md does not target that OS range.
+  be speculative given the product does not target that OS range.
