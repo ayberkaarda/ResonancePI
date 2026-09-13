@@ -84,6 +84,14 @@ Added after the operator asked for hover-to-expand and drag-to-reposition, on to
 | Drag repositions the widget and persists the new position | Press-hold on the at-rest icon, move, release | Window followed the cursor; `Settings.widget_position` ended up holding the exact expected value (cursor position minus the grab offset), confirmed by reading it back from the real store file and by a fresh relaunch restoring to that exact position |
 | Right-click "Hide" still works in both states | Right-click at rest and while grown | Menu appears in both; selecting "Hide" hides the widget (confirmed via the live window's visibility, not just a screenshot) |
 
+**Widget hides while the full panel is open, and comes back when it closes (added on request):** clicking the widget (or the hotkey, or the tray's "Toggle overlay") opens the full panel and now also hides the corner widget for as long as the panel is open — regardless of which of the three opened it — since the two floating on screen together was redundant clutter, the panel already offering everything the widget's icon leads to. Closing the panel restores the widget's on-screen state to whatever it was before, without ever touching the persisted `widget_visible` setting; this is a temporary, panel-lifetime-only hide, not a setting change. Verified on real hardware, both directions:
+
+| Scenario | Result |
+|---|---|
+| Widget visible, click it to open the panel | Panel opens; widget's window becomes invisible for as long as the panel is open |
+| Close the panel (hotkey, tray, or the panel's own close button) | Widget reappears exactly where it was |
+| Widget explicitly hidden (right-click "Hide") beforehand, then the panel is opened via the hotkey or tray and closed again | Widget stays hidden throughout — the panel's open/close never overrides an explicit "Hide" |
+
 **Cosmetic issue found above — fixed and reverified:** right-clicking while grown used to collapse the list back to the icon size while the context menu was still open (the pointer moving onto the menu triggered the same "mouse left the widget" detection that normally shrinks it). Fixed with a `menu_open` flag that suppresses the shrink for the exact span `TrackPopupMenuEx` is pumping messages, plus an explicit re-check of where the pointer actually ended up once the menu closes (the suppressed leave event is gone for good — Windows does not resend it). Reverified on real hardware: the list now stays fully expanded with the "Hide" menu open over it; choosing "Hide" still hides the widget correctly; dismissing the menu by clicking elsewhere correctly shrinks the widget back to its icon.
 
 ## Two real bugs found and fixed while testing the widget (unrelated to the widget itself)

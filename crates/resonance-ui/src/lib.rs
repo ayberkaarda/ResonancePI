@@ -191,15 +191,16 @@ pub fn run(
         initial_autostart,
     )));
 
-    let result = main_loop(
-        &signal_rx,
-        &ui_cmd_tx,
-        &state,
-        &latest_snapshot,
-        &waker,
-        &exit_flags,
-        widget.as_ref(),
-    );
+    let result = main_loop(MainLoopContext {
+        signal_rx: &signal_rx,
+        ui_cmd_tx: &ui_cmd_tx,
+        state: &state,
+        latest_snapshot: &latest_snapshot,
+        waker: &waker,
+        exit_flags: &exit_flags,
+        widget: widget.as_ref(),
+        initial_widget_visible,
+    });
 
     // Stops the bridge thread before the channels it holds go away.
     drop(bridge_shutdown_tx);
@@ -207,16 +208,38 @@ pub fn run(
     result
 }
 
+/// Everything [`main_loop`] needs, bundled so the function takes one argument
+/// instead of eight.
+struct MainLoopContext<'a> {
+    signal_rx: &'a Receiver<UiSignal>,
+    ui_cmd_tx: &'a Sender<UiCommand>,
+    state: &'a Arc<Mutex<OverlayState>>,
+    latest_snapshot: &'a Arc<Mutex<Option<Snapshot>>>,
+    waker: &'a Waker,
+    exit_flags: &'a ExitFlags,
+    widget: Option<&'a widget::Widget>,
+    /// Whether the corner widget is currently meant to be on screen — the
+    /// same thing `Settings.widget_visible` records, kept here too so the
+    /// panel's open/close handling below can tell whether the widget was
+    /// showing before it hid it for the panel, without that temporary hide
+    /// ever touching the saved setting.
+    initial_widget_visible: bool,
+}
+
 /// Sleeps until something asks for the overlay, shows it, and sleeps again.
-fn main_loop(
-    signal_rx: &Receiver<UiSignal>,
-    ui_cmd_tx: &Sender<UiCommand>,
-    state: &Arc<Mutex<OverlayState>>,
-    latest_snapshot: &Arc<Mutex<Option<Snapshot>>>,
-    waker: &Waker,
-    exit_flags: &ExitFlags,
-    widget: Option<&widget::Widget>,
-) -> eframe::Result {
+fn main_loop(ctx: MainLoopContext<'_>) -> eframe::Result {
+    let MainLoopContext {
+        signal_rx,
+        ui_cmd_tx,
+        state,
+        latest_snapshot,
+        waker,
+        exit_flags,
+        widget,
+        initial_widget_visible,
+    } = ctx;
+    let mut widget_visible = initial_widget_visible;
+
     loop {
         match signal_rx.recv() {
             // Every sender is gone, so nothing can ask for the overlay again.
@@ -225,8 +248,14 @@ fn main_loop(
             // afterwards, in that order: the visible state is what the user
             // asked for, and storing it is bookkeeping that must not decide
             // whether the widget moves.
-            Ok(UiSignal::ShowWidget) => set_widget_visible(ui_cmd_tx, widget, true),
-            Ok(UiSignal::HideWidget) => set_widget_visible(ui_cmd_tx, widget, false),
+            Ok(UiSignal::ShowWidget) => {
+                widget_visible = true;
+                set_widget_visible(ui_cmd_tx, widget, true);
+            }
+            Ok(UiSignal::HideWidget) => {
+                widget_visible = false;
+                set_widget_visible(ui_cmd_tx, widget, false);
+            }
             Ok(UiSignal::Quit) => {
                 if ui_cmd_tx.send(UiCommand::Quit).is_err() {
                     tracing::warn!("the backend had already stopped when quit was requested");
@@ -234,6 +263,19 @@ fn main_loop(
                 return Ok(());
             }
             Ok(UiSignal::ToggleOverlay) => {
+                // The widget and the full panel both floating on screen at
+                // once is visual clutter the panel already makes redundant —
+                // it opens from the same click/shortcut/menu the widget
+                // offers. Hidden here only for the panel's lifetime, not
+                // recorded as a setting: a widget the user explicitly hid
+                // stays hidden through this too, since `widget_visible` is
+                // `false` in that case and neither call below runs.
+                if widget_visible {
+                    if let Some(widget) = widget {
+                        widget.hide();
+                    }
+                }
+
                 show_overlay_until_closed(
                     signal_rx,
                     ui_cmd_tx,
@@ -242,6 +284,12 @@ fn main_loop(
                     waker,
                     exit_flags,
                 )?;
+
+                if widget_visible {
+                    if let Some(widget) = widget {
+                        widget.show();
+                    }
+                }
 
                 if ExitFlags::take(&exit_flags.quit) {
                     return Ok(());

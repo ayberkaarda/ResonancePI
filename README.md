@@ -24,11 +24,12 @@ Run `resonance-app.exe --overlay`. By default a small icon docks in the
 bottom-right corner of the screen; hover over it to see the connected
 devices and click one to switch to it directly, or click the icon itself
 (or press the global shortcut, or use the tray icon) to open the full
-overlay, pick a device tab, and adjust or forget per-application entries.
-Press and hold the icon to drag it anywhere on screen; it stays there
-across restarts. Right-click it to hide it; bring it back from the tray
-icon's "Show icon" menu item. Toggling "Start with Windows" in the
-settings panel launches it automatically at sign-in.
+overlay, pick a device tab, and adjust or forget per-application entries —
+the corner icon steps aside while the full overlay is open and comes back
+once it's closed. Press and hold the icon to drag it anywhere on screen;
+it stays there across restarts. Right-click it to hide it; bring it back
+from the tray icon's "Show icon" menu item. Toggling "Start with Windows"
+in the settings panel launches it automatically at sign-in.
 
 Two additional command-line modes exist for diagnosing the backend without
 any UI — `resonance-app --run` and `resonance-app --dump-events` — see
